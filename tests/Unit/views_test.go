@@ -44,7 +44,8 @@ func module(t *testing.T) *billing.Module {
 	t.Helper()
 
 	sessions := security.NewSessionStore([]byte(sessionKey), time.Hour, false, security.NewMemoryBackend())
-	m, err := billing.New(billing.Config{}, data.Wrap(nil, data.DialectSQLite), sessions)
+	handle := data.Wrap(nil, data.DialectSQLite)
+	m, err := billing.New(billing.Config{Providers: []billing.Provider{billing.ManualProvider{}}}, handle, sessions)
 	if err != nil {
 		t.Fatalf("building the module: %v", err)
 	}

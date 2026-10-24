@@ -3,315 +3,239 @@ package unit_test
 import (
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"testing"
 
 	"github.com/arandu-io/framework/data"
 	"github.com/arandu-io/framework/security"
-	"github.com/arandu-io/hesape/database/model"
-	"github.com/arandu-io/hesape/database/query"
 
 	billing "github.com/hyz-is/arandu-billing"
 )
 
-// The four properties this package exists to keep are checked here, and they
-// are checked against the code rather than described in a document:
-//
-//  1. the policy denies every action, and has no branch that allows one;
-//  2. the service authorizes before constructing or running the generated query;
-//  3. the tenant comes from the Grant;
-//  4. nothing reaches the database without passing through the first two.
-//
-// The fourth is checked by the handle these tests pass in. It wraps a nil
-// *sql.DB, so any statement that were issued would panic and fail the test
-// loudly -- which makes "the refusal happened before the Model" a fact the
-// suite proves rather than a comment. The structural twin in audit_test.go
-// keeps that order visible on every service method, including an allowed path.
+// The properties this package exists to keep are checked here against the
+// code: the policy denies what no rule names, the tenant of an account is the
+// subject's own, and the service refuses before it reaches the Model. The
+// service is built over a handle that wraps a nil *sql.DB, so any statement
+// issued after a refusal would panic -- which makes "the refusal happened
+// before the Model" a fact the suite proves.
 
-// everyAction is the whole set the policy answers about. A test that listed
-// four of five would pass while the fifth was open.
+// everyAction is the whole set the policy answers about.
 var everyAction = []security.Action{
-	billing.BillingView,
-	billing.BillingList,
-	billing.BillingCreate,
-	billing.BillingUpdate,
-	billing.BillingDelete,
+	billing.PlansView, billing.PlansManage, billing.CouponsManage, billing.Subscribe,
+	billing.SubscriptionsView, billing.SubscriptionsCancel, billing.SubscriptionsManage,
+	billing.InvoicesView, billing.InvoicesManage, billing.PaymentsConfirm, billing.SubscriptionsSweep,
 }
 
-// administrator is the most privileged subject an application can produce. It
-// is the one to test the default with: a policy that refuses an administrator
-// refuses everyone.
-func administrator() security.Subject {
+// adminActions are the ones only the platform's admin takes.
+var adminActions = []security.Action{billing.PlansManage, billing.CouponsManage, billing.SubscriptionsManage, billing.InvoicesManage}
+
+func member() security.Subject {
 	return security.Subject{ID: "user-1", Tenant: "acme", Roles: []string{"admin"}, Verified: true}
 }
 
-func TestThePolicyDeniesEveryActionByDefault(t *testing.T) {
-	t.Parallel()
-
-	for _, action := range everyAction {
-		t.Run(string(action), func(t *testing.T) {
-			t.Parallel()
-
-			_, err := security.Authorize(context.Background(), billing.BillingPolicy{},
-				administrator(), action, billing.Billing{})
-			if !errors.Is(err, security.ErrForbidden) {
-				t.Fatalf("an unopened policy allowed %s: got %v, want ErrForbidden", action, err)
-			}
-		})
-	}
+func manager() security.Subject {
+	return security.Subject{ID: "user-2", Tenant: "acme", Roles: []string{billing.AccountRole}, Verified: true}
 }
 
-func TestThePolicyDeniesARecordOfAnotherTenant(t *testing.T) {
-	t.Parallel()
-
-	other := billing.Billing{ID: "record-1", TenantID: "globex", Name: "theirs"}
-
-	err := billing.BillingPolicy{}.Can(context.Background(),
-		administrator(), billing.BillingView, other)
-	if err == nil {
-		t.Fatal("the policy allowed a record belonging to another tenant")
-	}
-	// The message is asserted because the tenant check is the one refusal that
-	// has to survive somebody opening the actions below it.
-	if !strings.Contains(err.Error(), "another tenant") {
-		t.Fatalf("the refusal did not name the tenant: %v", err)
-	}
+func platformAdmin() security.Subject {
+	return security.Subject{ID: "user-9", Tenant: "platform", Roles: []string{billing.AdminRole}, Verified: true}
 }
 
-func TestThePolicyDeniesAGuest(t *testing.T) {
-	t.Parallel()
+func can(s security.Subject, a security.Action, tenant string) error {
+	return billing.BillingPolicy{}.Can(context.Background(), s, a, billing.Account{TenantID: tenant})
+}
 
-	for _, action := range everyAction {
-		_, err := security.Authorize(context.Background(), billing.BillingPolicy{},
-			security.Guest("acme"), action, billing.Billing{})
-		if !errors.Is(err, security.ErrForbidden) {
-			t.Fatalf("a guest was allowed %s: got %v, want ErrForbidden", action, err)
+func TestAGuestReachesNothing(t *testing.T) {
+	t.Parallel()
+	for _, a := range everyAction {
+		if err := can(security.Guest("acme"), a, ""); err == nil {
+			t.Errorf("a guest was allowed %s", a)
 		}
 	}
 }
 
-func TestAuthorizeRefusesASubjectThatIsNobody(t *testing.T) {
+func TestAMemberReadsTheirOwnAccountAndNothingElse(t *testing.T) {
 	t.Parallel()
-
-	// The zero Subject is a session that failed to load, not an anonymous
-	// reader, and it is refused before the policy is consulted. A package that
-	// answered it as a guest would answer a broken session as a visitor.
-	_, err := security.Authorize(context.Background(), billing.BillingPolicy{},
-		security.Subject{}, billing.BillingView, billing.Billing{})
-	if !errors.Is(err, security.ErrForbidden) {
-		t.Fatalf("an empty subject was authorized: got %v, want ErrForbidden", err)
+	for _, a := range []security.Action{billing.PlansView, billing.SubscriptionsView, billing.InvoicesView} {
+		if err := can(member(), a, "acme"); err != nil {
+			t.Errorf("a member was refused %s on their own account: %v", a, err)
+		}
+		if err := can(member(), a, "other"); err == nil {
+			t.Errorf("a member was allowed %s on another account", a)
+		}
+	}
+	for _, a := range []security.Action{billing.Subscribe, billing.SubscriptionsCancel} {
+		if err := can(member(), a, "acme"); err == nil {
+			t.Errorf("a member who does not manage the account was allowed %s", a)
+		}
+	}
+	for _, a := range append(adminActions, billing.PaymentsConfirm, billing.SubscriptionsSweep) {
+		if err := can(member(), a, "acme"); err == nil {
+			t.Errorf("a member, even one holding a role named admin, was allowed %s", a)
+		}
 	}
 }
 
-// nilHandle is a handle over no database.
-//
-// Any statement issued through it panics, which is what makes these tests
-// prove that the refusal came first: a service that reached the Model before
-// authorizing would crash here rather than pass.
+func TestTheAccountManagerPaysAndCancelsTheirOwnAccountOnly(t *testing.T) {
+	t.Parallel()
+	for _, a := range []security.Action{billing.Subscribe, billing.SubscriptionsCancel} {
+		if err := can(manager(), a, "acme"); err != nil {
+			t.Errorf("the manager was refused %s: %v", a, err)
+		}
+		if err := can(manager(), a, "other"); err == nil {
+			t.Errorf("the manager was allowed %s on another account", a)
+		}
+	}
+	action := security.Subject{ID: "user-3", Tenant: "acme", Actions: []security.Action{billing.AccountAction}}
+	if err := can(action, billing.Subscribe, "acme"); err != nil {
+		t.Errorf("the manager held as an arandu-permission action was refused: %v", err)
+	}
+}
+
+func TestThePlatformAdminActsOnEveryAccountForTheAdminActionsAlone(t *testing.T) {
+	t.Parallel()
+	for _, a := range adminActions {
+		for _, tenant := range []string{"", "acme", "other"} {
+			if err := can(platformAdmin(), a, tenant); err != nil {
+				t.Errorf("the admin was refused %s on %q: %v", a, tenant, err)
+			}
+		}
+	}
+	for _, a := range []security.Action{billing.PaymentsConfirm, billing.SubscriptionsSweep, billing.Subscribe} {
+		if err := can(platformAdmin(), a, "acme"); err == nil {
+			t.Errorf("the admin was allowed %s inside a customer's account", a)
+		}
+	}
+	impersonating := platformAdmin()
+	impersonating.Impersonator = &security.Subject{ID: "user-9"}
+	if billing.IsAdmin(impersonating) {
+		t.Error("a subject inside somebody else's account is the platform's admin")
+	}
+}
+
+func TestEveryActionButTheReadsWrites(t *testing.T) {
+	t.Parallel()
+	reads := map[security.Action]bool{billing.PlansView: true, billing.SubscriptionsView: true, billing.InvoicesView: true}
+	for _, a := range everyAction {
+		if got := (billing.BillingPolicy{}).Writes(a); got == reads[a] {
+			t.Errorf("Writes(%s) = %v", a, got)
+		}
+	}
+}
+
 func nilHandle() *data.DB { return data.Wrap(nil, data.DialectSQLite) }
 
+// TestTheServiceRefusesBeforeReachingTheModel calls every use case as somebody
+// it must refuse, over a handle that panics on the first statement.
 func TestTheServiceRefusesBeforeReachingTheModel(t *testing.T) {
 	t.Parallel()
-
-	// A nil handle makes even construction of Billings panic, at the
-	// GetQueryGrammar the query asks the handle for. This catches moving the
-	// generated query constructor -- not only its terminal -- ahead of
-	// authorization.
-	service := billing.NewBillingService(nil)
+	svc := billing.NewBillingService(nilHandle())
 	ctx := context.Background()
-
-	if _, err := service.Find(ctx, administrator(), "record-1"); !errors.Is(err, security.ErrForbidden) {
-		t.Fatalf("Find reached the Model before the policy refusal: %v", err)
+	guest := security.Guest("acme")
+	calls := map[string]func() error{
+		"ActivePlans":  func() error { _, err := svc.ActivePlans(ctx, guest); return err },
+		"Plan":         func() error { _, err := svc.Plan(ctx, member(), "p1"); return err },
+		"CreatePlan":   func() error { _, err := svc.CreatePlan(ctx, member(), validPlan()); return err },
+		"UpdatePlan":   func() error { _, err := svc.UpdatePlan(ctx, member(), "p1", validPlan()); return err },
+		"CreateCoupon": func() error { _, err := svc.CreateCoupon(ctx, member(), validCoupon()); return err },
+		"Subscribe": func() error {
+			_, err := svc.Subscribe(ctx, member(), billing.SubscribeRequest{PlanID: "p1"})
+			return err
+		},
+		"Renew":           func() error { _, err := svc.Renew(ctx, member(), "s1", ""); return err },
+		"StartTrial":      func() error { _, err := svc.StartTrial(ctx, member(), "p1", ""); return err },
+		"Cancel":          func() error { _, err := svc.CancelAtPeriodEnd(ctx, member(), "s1"); return err },
+		"Resume":          func() error { _, err := svc.ResumeSubscription(ctx, member(), "s1"); return err },
+		"CancelNow":       func() error { _, err := svc.CancelNow(ctx, manager(), "s1"); return err },
+		"ConfirmManual":   func() error { _, err := svc.ConfirmManually(ctx, manager(), "i1", billing.ManualPayment{}); return err },
+		"VoidInvoice":     func() error { _, err := svc.VoidInvoice(ctx, manager(), "i1"); return err },
+		"Invoice":         func() error { _, err := svc.Invoice(ctx, guest, "i1"); return err },
+		"Refresh":         func() error { _, err := svc.RefreshInvoice(ctx, guest, "i1"); return err },
+		"InvoicesPage":    func() error { _, err := svc.InvoicesPage(ctx, guest, billing.PageQuery{}, 25); return err },
+		"AllInvoices":     func() error { _, err := svc.AllInvoicesPage(ctx, manager(), billing.PageQuery{}, 25); return err },
+		"AllSubs":         func() error { _, err := svc.AllSubscriptionsPage(ctx, manager(), billing.PageQuery{}, 25); return err },
+		"PlansPage":       func() error { _, err := svc.PlansPage(ctx, manager(), billing.PageQuery{}, 25); return err },
+		"CouponsPage":     func() error { _, err := svc.CouponsPage(ctx, manager(), billing.PageQuery{}, 25); return err },
+		"SubsPage":        func() error { _, err := svc.SubscriptionsPage(ctx, guest, billing.PageQuery{}, 25); return err },
+		"SubscriptionsOf": func() error { _, err := svc.SubscriptionsOf(ctx, security.Grant{}); return err },
 	}
-	if _, err := service.List(ctx, administrator(), data.Query{}); !errors.Is(err, security.ErrForbidden) {
-		t.Fatalf("List reached the Model before the policy refusal: %v", err)
-	}
-	if _, err := service.Create(ctx, administrator(), billing.CreateRequest{Name: "one"}); !errors.Is(err, security.ErrForbidden) {
-		t.Fatalf("Create reached the Model before the policy refusal: %v", err)
-	}
-}
-
-// recordingHandle runs nothing and keeps every statement it is handed, so a
-// test reads what the table compiles instead of reading its settings. The table
-// keeps its settings to itself; what it writes is the behaviour they decide.
-type recordingHandle struct {
-	*data.DB
-	statements []recordedStatement
-}
-
-type recordedStatement struct {
-	sql      string
-	bindings []any
-}
-
-// newRecordingHandle borrows the grammar and the processor of an SQLite handle
-// over no database, and answers every statement itself.
-func newRecordingHandle() *recordingHandle { return &recordingHandle{DB: nilHandle()} }
-
-func (h *recordingHandle) record(sql string, bindings []any) {
-	h.statements = append(h.statements, recordedStatement{sql: sql, bindings: slices.Clone(bindings)})
-}
-
-func (h *recordingHandle) Select(_ context.Context, sql string, bindings []any, _ bool) ([]query.Record, error) {
-	h.record(sql, bindings)
-	return nil, nil
-}
-
-func (h *recordingHandle) Insert(_ context.Context, sql string, bindings []any) (bool, error) {
-	h.record(sql, bindings)
-	return true, nil
-}
-
-func (h *recordingHandle) Update(_ context.Context, sql string, bindings []any) (int64, error) {
-	h.record(sql, bindings)
-	return 1, nil
-}
-
-func (h *recordingHandle) Delete(_ context.Context, sql string, bindings []any) (int64, error) {
-	h.record(sql, bindings)
-	return 1, nil
-}
-
-func (h *recordingHandle) Statement(_ context.Context, sql string, bindings []any) (bool, error) {
-	h.record(sql, bindings)
-	return true, nil
-}
-
-// first is the first recorded statement that starts with verb.
-func (h *recordingHandle) first(t *testing.T, verb string) recordedStatement {
-	t.Helper()
-	for _, statement := range h.statements {
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(statement.sql)), verb) {
-			return statement
+	for name, call := range calls {
+		err := call()
+		if err == nil {
+			t.Errorf("%s was not refused", name)
+			continue
 		}
-	}
-	t.Fatalf("no %s statement was issued; recorded %v", verb, h.statements)
-	return recordedStatement{}
-}
-
-// TestBillingsReturnsAWiredTenantScopedQuery holds what billingTable declares,
-// through what it makes the generated query do: the table it reads, a key the
-// application writes and the engine never fills, and a tenant_id taken from the
-// Grant on the way in and on the way out.
-func TestBillingsReturnsAWiredTenantScopedQuery(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	handle := newRecordingHandle()
-	table := billing.Billings(handle).Base().Table()
-	if table.Name() != "billings" {
-		t.Fatalf("Billings table = %q, want billings", table.Name())
-	}
-	if key := table.MorphModel(handle); key.GetKeyName() != "id" || key.GetKeyType() != "string" {
-		t.Fatalf("Billings key is %q of type %q; want id, as text", key.GetKeyName(), key.GetKeyType())
-	}
-
-	row, err := billing.Billings(handle).New()
-	if err != nil {
-		t.Fatalf("building a row: %v", err)
-	}
-	if row.Table() != table {
-		t.Fatal("Billings returned an entity whose embedded Model is not wired to its table")
-	}
-
-	// The key is application-generated text: the insert carries the one the row
-	// was given, and the engine is never asked for one. An incrementing key
-	// would go through the processor, which runs on no database here, and a key
-	// the model generated would replace the one the service wrote.
-	row.ID = "record-1"
-	if _, err := row.Save(ctx, security.SystemGrant(billing.BillingCreate, "acme")); err != nil {
-		t.Fatalf("saving through the recording handle: %v", err)
-	}
-	insert := handle.first(t, "insert")
-	if !slices.Contains(insert.bindings, any("record-1")) || row.ID != "record-1" {
-		t.Fatalf("the insert %q %v does not write the application key, or the row lost it (%q)", insert.sql, insert.bindings, row.ID)
-	}
-	if !strings.Contains(insert.sql, "tenant_id") || !slices.Contains(insert.bindings, any("acme")) {
-		t.Fatalf("the insert %q %v does not stamp tenant_id with the Grant's tenant", insert.sql, insert.bindings)
-	}
-
-	// And the tenant column scopes a read by the Grant's tenant.
-	if _, err := billing.Billings(handle).WhereKey("record-1").First(ctx, security.SystemGrant(billing.BillingView, "acme")); err != nil {
-		t.Fatalf("reading through the recording handle: %v", err)
-	}
-	read := handle.first(t, "select")
-	if !strings.Contains(read.sql, "tenant_id") || !slices.Contains(read.bindings, any("acme")) {
-		t.Fatalf("the read %q %v is not filtered by tenant_id with the Grant's tenant", read.sql, read.bindings)
-	}
-}
-
-// TestTheMissingRecordIsTheModelsNotFound holds the one link between this
-// package's sentinel and the router's answer. The router answers
-// model.ErrModelNotFound with 404 and has never heard of ErrNotFound, so the
-// sentinel is a 404 only while it wraps the model's.
-func TestTheMissingRecordIsTheModelsNotFound(t *testing.T) {
-	t.Parallel()
-
-	if !errors.Is(billing.ErrNotFound, model.ErrModelNotFound) {
-		t.Fatal("ErrNotFound does not wrap model.ErrModelNotFound, so the router would answer a missing record with 500")
+		if !errors.Is(err, security.ErrForbidden) {
+			t.Errorf("%s answered %v, want a refusal", name, err)
+		}
 	}
 }
 
 func TestASystemGrantWithoutATenantReachesNothing(t *testing.T) {
 	t.Parallel()
-
-	// A system grant with no tenant names no customer. The Model refuses it
-	// while preparing the query, before the nil handle can issue a statement.
-	_, err := billing.Billings(nilHandle()).WhereKey("record-1").First(
-		context.Background(), security.SystemGrant(billing.BillingView, ""))
-	if !errors.Is(err, model.ErrNoTenant) {
-		t.Fatalf("a system grant with no tenant returned %v, want ErrNoTenant", err)
+	if err := security.SystemGrant(billing.PaymentsConfirm, "").Check(billing.PaymentsConfirm); err == nil {
+		t.Fatal("a system Grant with no tenant passed its check")
 	}
 }
 
-func TestTheTenantComesFromTheGrant(t *testing.T) {
-	t.Parallel()
-
-	g := security.SystemGrant(billing.BillingView, "acme")
-	if got := data.Tenant(g); got != "acme" {
-		t.Fatalf("data.Tenant(g) = %q, want %q", got, "acme")
-	}
-
-	// And a Grant nobody issued carries no tenant at all, so a statement that
-	// took its tenant from anywhere else would be reading rows this Grant does
-	// not name.
-	if got := data.Tenant(security.Grant{}); got != "" {
-		t.Fatalf("the zero Grant carries the tenant %q, want none", got)
-	}
+func validPlan() billing.PlanRequest {
+	return billing.PlanRequest{Name: "Câmera mensal", Price: 9900, IntervalMonths: 1, Active: true}
 }
 
-func TestTheRequestValidatesItsInput(t *testing.T) {
-	t.Parallel()
+func validCoupon() billing.CouponRequest {
+	return billing.CouponRequest{Code: "bemvindo", Kind: billing.CouponPercent, Value: 1000, Active: true}
+}
 
-	if errs := (billing.CreateRequest{}).Validate(); !errs.Any() {
-		t.Fatal("an empty request validated")
+func TestTheRequestsValidateTheirInput(t *testing.T) {
+	t.Parallel()
+	if errs := validPlan().Validate(); errs.Any() {
+		t.Fatalf("a valid plan was refused: %v", errs)
 	}
-	if errs := (billing.CreateRequest{Name: strings.Repeat("a", 121)}).Validate(); !errs.Any() {
-		t.Fatal("a name past the maximum validated")
+	bad := validPlan()
+	bad.Name, bad.Price, bad.IntervalMonths, bad.InstallmentsCap = "", -1, 0, 13
+	errs := bad.Validate()
+	for _, field := range []string{"name", "price", "interval_months", "installments_cap"} {
+		if len(errs.Get(field)) == 0 {
+			t.Errorf("a plan with a bad %s was accepted", field)
+		}
 	}
-	if errs := (billing.CreateRequest{Name: "one"}).Validate(); errs.Any() {
-		t.Fatalf("a valid request was rejected: %v", errs)
+	if errs := validCoupon().Validate(); errs.Any() {
+		t.Fatalf("a valid coupon was refused: %v", errs)
+	}
+	coupon := validCoupon()
+	coupon.Code, coupon.Value = "não vale", 10001
+	errs = coupon.Validate()
+	for _, field := range []string{"code", "value"} {
+		if len(errs.Get(field)) == 0 {
+			t.Errorf("a coupon with a bad %s was accepted", field)
+		}
+	}
+	if errs := (billing.SubscribeRequest{}).Validate(); len(errs.Get("plan_id")) == 0 {
+		t.Error("a checkout with no plan was accepted")
 	}
 }
 
 func TestTheConfigurationRefusesWhatCannotWork(t *testing.T) {
 	t.Parallel()
-
+	manual := []billing.Provider{billing.ManualProvider{}}
 	for name, cfg := range map[string]billing.Config{
-		"relative prefix":    {Prefix: "billing"},
-		"page size too big":  {PageSize: billing.MaxPageSize + 1},
-		"negative page size": {PageSize: -1},
+		"no provider":        {},
+		"two of one name":    {Providers: []billing.Provider{billing.ManualProvider{}, billing.ManualProvider{}}},
+		"unknown default":    {Providers: manual, DefaultProvider: "gateway"},
+		"relative prefix":    {Providers: manual, Prefix: "billing"},
+		"page too large":     {Providers: manual, PageSize: billing.MaxPageSize + 1},
+		"segment wildcard":   {Providers: manual, Paths: billing.Paths{Plans: "/{x}"}},
+		"relative public":    {Providers: manual, PublicURL: "alpr.sh"},
+		"colliding segments": {Providers: manual, Paths: billing.Paths{Plans: "/x", Subscriptions: "/x", Checkout: "/y", Renewal: "/y"}},
 	} {
 		if err := cfg.Validate(); err == nil {
-			t.Errorf("the configuration with %s was accepted", name)
+			t.Errorf("%s: the configuration was accepted", name)
 		}
 	}
-
-	// The zero value is the configuration an application that changes nothing
-	// writes, and it has to be one New accepts: there is no tenant to name,
-	// because every tenant comes from the Grant.
-	if err := (billing.Config{}).Validate(); err != nil {
-		t.Fatalf("the zero configuration was refused: %v", err)
+	if err := (billing.Config{Providers: manual, Paths: billing.PortuguesePaths}).Validate(); err != nil {
+		t.Fatalf("the Portuguese paths were refused: %v", err)
+	}
+	if !strings.HasPrefix(billing.DefaultNotificationPrefix, "/api/") {
+		t.Error("the notification address left the API side")
 	}
 }

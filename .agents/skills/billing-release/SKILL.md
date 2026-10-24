@@ -38,7 +38,7 @@ project: no go.mod, main.go and arandu.toml together"* — it reads applications
 and this is a library.
 
 `aru model:build` is different: it works on a module root, and it is what wrote
-`BillingQuery.go`. Run it after any change to the entity, and before a release
+`PlanQuery.go`. Run it after any change to the entity, and before a release
 
 ```sh
 aru model:build --check
@@ -67,7 +67,7 @@ opened by nothing but that package's own suite.
 
 ```toml
 name = "hyz-is/billing"
-framework = ">= 0.64"
+framework = ">= 0.65"
 profiles = ["conventional", "performance"]
 
 [permissions]
@@ -143,8 +143,8 @@ it is, and what they have to write instead.
 Run `apidiff` against the release baseline and enumerate every removal; the CI
 step named `api diff against the last release` fails unless `UPGRADE.md` names
 each one. A move to a new shape of the model breaks more than its own
-signatures: `Billings` changing what it returns is one line, and every method
-the old embedded model promoted on `*Billing` that the new one does not is
+signatures: `Plans` changing what it returns is one line, and every method
+the old embedded model promoted on `*Plan` that the new one does not is
 another, each named on its own. Keeping `ErrNotFound` in `model.go` is not a
 removal just because its value changed.
 

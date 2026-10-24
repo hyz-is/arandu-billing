@@ -112,24 +112,24 @@ func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
 	wants := map[string][]string{
 		"model.go": {
 			`"github.com/arandu-io/hesape/database/model"`,
-			"type Billing struct {\n\tmodel.Model\n",
-			"var billingTable = model.NewTable(model.TableSpec{",
+			"type Plan struct {\n\tmodel.Model\n",
+			"var planTable = model.NewTable(model.TableSpec{",
 			"ManualKey: true,",
 			"// arandu:begin custom\n",
 			"// arandu:end custom\n",
 		},
-		"BillingQuery.go": {
+		"PlanQuery.go": {
 			generatedHeading,
-			"func Billings(db model.DB) *BillingQuery",
-			"type BillingCollection []*Billing",
+			"func Plans(db model.DB) *PlanQuery",
+			"type PlanCollection []*Plan",
 		},
 		"service.go": {
 			"db     *data.DB",
 			"func NewBillingService(db *data.DB) *BillingService",
-			"Billings(s.db).New()",
-			"Billings(s.db).WhereKey(",
-			") (*Billing, error)",
-			") ([]*Billing, error)",
+			"Plans(s.db).New()",
+			"Plans(s.db).WhereKey(",
+			") (*Plan, error)",
+			") ([]*Plan, error)",
 		},
 		"module.go": {
 			"NewBillingService(db)",
@@ -172,8 +172,8 @@ func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
 				t.Errorf("%s still spells the generic model layer %q", filepath.ToSlash(relative), stale)
 			}
 		}
-		if relative != "BillingQuery.go" && strings.Contains(string(body), generatedHeading) {
-			t.Errorf("%s carries the heading of the generated query, which only BillingQuery.go may", filepath.ToSlash(relative))
+		if !strings.HasSuffix(relative, "Query.go") && strings.Contains(string(body), generatedHeading) {
+			t.Errorf("%s carries the heading of the generated query, which only a generated *Query.go may", filepath.ToSlash(relative))
 		}
 		return nil
 	})
@@ -191,13 +191,13 @@ func TestTheGuidesTeachTheGeneratedModelBoundary(t *testing.T) {
 
 	root := packageRoot(t)
 	guides := map[string][]string{
-		"AGENTS.md":                               {"Billings(db)", "security.Authorize"},
-		"README.md":                               {"Billings(db)", "BillingQuery", "aru model:build", "RequireAuth"},
-		"CONTRIBUTING.md":                         {"Billings(db)", "authorizes before reaching the Model", "aru model:build"},
+		"AGENTS.md":                               {"Plans(db)", "security.Authorize"},
+		"README.md":                               {"Plans(db)", "PlanQuery", "aru model:build", "RequireAuth"},
+		"CONTRIBUTING.md":                         {"Plans(db)", "authorizes before reaching the Model", "aru model:build"},
 		"SECURITY.md":                             {"Model terminal", "data.Tenant(g)"},
-		".agents/skills/README.md":                {"BillingQuery", "custom block"},
-		".agents/skills/billing-module/SKILL.md":  {"billingTable", "ctx.User()", "RequireAuth", "return err"},
-		".agents/skills/billing-policy/SKILL.md":  {"security.Authorize", "Billings(s.db).New()"},
+		".agents/skills/README.md":                {"PlanQuery", "custom block"},
+		".agents/skills/billing-module/SKILL.md":  {"planTable", "ctx.User()", "RequireAuth", "return err"},
+		".agents/skills/billing-policy/SKILL.md":  {"security.Authorize", "Plans(s.db).New()"},
 		".agents/skills/billing-release/SKILL.md": {"model:build --check", "configured copy"},
 		".agents/skills/billing-package/SKILL.md": {"RequireAuth", "/auth/login"},
 	}
@@ -252,9 +252,12 @@ func TestHandlersLeaveTheSubjectAndTheStatusToTheFramework(t *testing.T) {
 			methods[function.Name.Name] = function
 		}
 	}
-	routes := methods["Routes"]
+	// Routes, AccountRoutes and AdminRoutes all register through register,
+	// which mounts the guard and walks the route table; the table's handlers
+	// are the method values the handlers method maps each route name to.
+	routes := methods["register"]
 	if routes == nil {
-		t.Fatal("Module has no Routes method")
+		t.Fatal("Module has no register method")
 	}
 
 	// The guard is mounted on the router before the first route is registered
@@ -289,7 +292,7 @@ func TestHandlersLeaveTheSubjectAndTheStatusToTheFramework(t *testing.T) {
 		return true
 	})
 
-	handlers := registeredHandlers(routes)
+	handlers := registeredHandlers(methods["handlers"])
 	if len(handlers) == 0 {
 		t.Fatal("Routes registers no Module handler")
 	}
@@ -406,6 +409,12 @@ func inspectExplicitComposition(t *testing.T, root string) {
 				if node.Name.Name != "Provider" && !strings.HasSuffix(node.Name.Name, "ServiceProvider") {
 					return true
 				}
+				// The payment gateway's contract is named Provider because
+				// that is the word for it; it composes nothing. It is the
+				// one in provider.go, an interface declaring CreateCheckout.
+				if node.Name.Name == "Provider" && source.path == "provider.go" && declaresCheckout(node) {
+					return true
+				}
 				if node.Name.Name == "AppServiceProvider" {
 					appProviderFound = true
 					return true
@@ -487,7 +496,7 @@ func inspectServiceBoundary(t *testing.T, root string) {
 				continue
 			}
 			methods[declaration.Name.Name] = declaration
-			if declaration.Name.Name == "Routes" {
+			if declaration.Name.Name == "handlers" {
 				routes = declaration
 			}
 		}
@@ -579,13 +588,25 @@ func productionGoFiles(t *testing.T, root string) []parsedGoFile {
 	return files
 }
 
-// registeredHandlers is every method of the receiver handed to a call that
+// registeredHandlers is every method of the receiver the handlers method maps
+// a route name to, or handed to a call that
 // registers a route. Only those calls: the guard is mounted with a call that
 // takes a field of the receiver too, and a field is not a handler.
 func registeredHandlers(routes *ast.FuncDecl) map[string]bool {
 	handlers := map[string]bool{}
+	if routes == nil {
+		return handlers
+	}
 	receiver := receiverName(routes)
 	ast.Inspect(routes.Body, func(node ast.Node) bool {
+		if pair, ok := node.(*ast.KeyValueExpr); ok {
+			if handler, ok := pair.Value.(*ast.SelectorExpr); ok {
+				if owner, ok := handler.X.(*ast.Ident); ok && owner.Name == receiver {
+					handlers[handler.Sel.Name] = true
+				}
+			}
+			return true
+		}
 		call, ok := node.(*ast.CallExpr)
 		if !ok || !routeVerbs[selectorName(call.Fun)] {
 			return true
@@ -643,4 +664,21 @@ func packageRoot(t *testing.T) string {
 		t.Fatal("finding package root")
 	}
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+}
+
+// declaresCheckout says the type is the payment gateway's interface: it
+// declares CreateCheckout, which no composition contract does.
+func declaresCheckout(spec *ast.TypeSpec) bool {
+	iface, ok := spec.Type.(*ast.InterfaceType)
+	if !ok {
+		return false
+	}
+	for _, method := range iface.Methods.List {
+		for _, name := range method.Names {
+			if name.Name == "CreateCheckout" {
+				return true
+			}
+		}
+	}
+	return false
 }

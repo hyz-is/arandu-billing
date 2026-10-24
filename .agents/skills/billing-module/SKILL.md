@@ -1,6 +1,6 @@
 ---
 name: billing-module
-description: Change what this Arandu package registers — its routes, handlers, configuration, response shape or schema. Use when the request is to "add a route", "add an endpoint", "add a handler", "add a config option", "change the prefix", "add a field to the response", "add a column", "write a migration", "return the tenant id too", "add a background job to the package", "make it run something at boot", "add a scope", "add a rule to the entity", "regenerate the query", "who is the current user in a handler", "return 404", or when a change touches module.go, config.go, model.go or BillingQuery.go. Covers foundation.Module and the five optional interfaces beside it, why handlers are thin, the RequireAuth guard and ctx.User, returning errors for the router to answer, the generated query and aru model:build, where the rules of the entity live, the migration name that carries the order, and what Resource is for.
+description: Change what this Arandu package registers — its routes, handlers, configuration, response shape or schema. Use when the request is to "add a route", "add an endpoint", "add a handler", "add a config option", "change the prefix", "add a field to the response", "add a column", "write a migration", "return the tenant id too", "add a background job to the package", "make it run something at boot", "add a scope", "add a rule to the entity", "regenerate the query", "who is the current user in a handler", "return 404", or when a change touches module.go, config.go, model.go or PlanQuery.go. Covers foundation.Module and the five optional interfaces beside it, why handlers are thin, the RequireAuth guard and ctx.User, returning errors for the router to answer, the generated query and aru model:build, where the rules of the entity live, the migration name that carries the order, and what Resource is for.
 license: MIT
 ---
 
@@ -71,11 +71,11 @@ registered before the guard is mounted.
 The name is what a URL is built from. Two spellings of one address disagree, and
 the failure when they do is a link to a 404. The prefix is `m.cfg.Prefix` and
 never a literal: the application decides where the package is mounted, and
-`TestTheModuleRegistersItsRoutesUnderItsPrefix` at
-`tests/Feature/routes_test.go:210` mounts it at `/widgets` and fails if any
-route came out anywhere else, or if `everyRoute` does not reach it. It also
-asserts every route is tagged with the module name, which is what
-`aru route:list` groups by.
+`TestTheRoutesFollowTheConfiguredPrefixes` in `tests/Feature/routes_test.go`
+mounts it at `/painel` and `/admin/cobranca` and fails if any route came out
+anywhere else. The route table lives in `paths.go` (`routeTable`), and the
+addresses a screen links to are built by the same `URLs` methods, so a link and
+the pattern that answers it are one spelling.
 
 **2. Write the handler thin.** Read the input and who is asking, ask the
 service, answer:
@@ -101,7 +101,7 @@ what it is handed, so a nil resource panics inside the framework rather than
 answering 204.
 
 No rule and no Model construction lives in a handler. A handler that held the
-database or called `Billings` would bypass the only place the Policy is
+database or called `Plans` would bypass the only place the Policy is
 guaranteed to run. Read `billing-policy` before writing the Service method.
 
 **3. Return the error; the router answers it.** The handler writes `return err`
@@ -128,20 +128,19 @@ time, and the reason is in the log, where the person operating the system reads
 it and the person probing it does not.
 
 `ErrNotFound` is a 404 because it wraps `model.ErrModelNotFound`;
-`TestTheMissingRecordIsTheModelsNotFound` holds that. A failure of the module's
+`TestOneAccountReachesNoOtherAccountsBilling` drives it. A failure of the module's
 own that should answer some other status is an error type with an
 `HTTPStatus() int` method, never a `switch` in the handler.
 `TestHandlersLeaveTheSubjectAndTheStatusToTheFramework` fails on a handler that
 calls `errors.Is` or `errors.As`, `fhttp.Refuse`, `fhttp.Reject` or
 `http.Error`.
 
-**4. Add the case to the route tests.** `everyRoute` at
-`tests/Feature/routes_test.go:118` is a table of every route.
-`TestAVisitorWithNoSessionIsSentToSignIn` asserts each one sends a request with
-no session to `/auth/login`, and `TestASignedInSubjectReachesThePolicyAndIsRefused`
-asserts each one answers a signed-in administrator 403 from the closed policy.
-Both run against `data.Wrap(nil, data.DialectSQLite)` — a handle over no
-database — so a route that got past the policy panics rather than passes.
+**4. Count it in the route tests.** `TestEveryRouteSendsAVisitorWithNoSessionToSignIn`
+walks the registered table and asserts each route sends a request with no
+session to sign in, and `TestEveryAdminRouteRefusesAnAccountsManager` asserts
+each admin route answers an account's manager 403; both hold the number of
+routes, so a new one changes the count in the same commit. The gateways'
+notification is the one route without a session, in `notifications.go`.
 
 ## Where the subject comes from
 
@@ -160,26 +159,30 @@ to serve without any session is a `security.Guest` the code declares on purpose
 
 ## Changing the Model
 
-`Billing` embeds `model.Model`, and `billingTable` declares its table once,
-beside it in `model.go`. Keep the application-generated key and the tenant
-default visible there:
+Each entity embeds `model.Model`, and its table is declared once beside it in
+`model.go`. `planTable` is the catalogue's:
 
 ```go
-var billingTable = model.NewTable(model.TableSpec{
-	Name:      "billings",
-	New:       func() model.Entity { return new(Billing) },
+var planTable = model.NewTable(model.TableSpec{
+	Name:      plansTable,
+	New:       func() model.Entity { return new(Plan) },
 	ManualKey: true,
+	Global:    true,
 })
 ```
 
-`ManualKey` because the key is text the service writes from `data.NewID()`: the
-database neither increments it nor fills it. Do not set `Global: true`: this
-package owns tenant data. Model terminals require a Grant and apply `tenant_id`;
+`ManualKey` because the key is text the service writes from `data.NewID()`.
+`Global` only for the catalogue -- plans and coupons, which every account reads
+the same -- and for the read models in `internal/everytenant`; the
+subscriptions, invoices, payments and coupon usages keep the `tenant_id`
+default, because they are an account's data. Model terminals require a Grant;
 the Service still calls `security.Authorize` first because the Model does not
-decide which Policy action the Grant represents.
+decide which Policy action the Grant represents. After a change to an entity,
+run `aru model:build` at the root (it writes `internal/everytenant` too) and
+commit what it wrote.
 
-`BillingQuery.go` is generated from that declaration: `Billings(db)`, the
-`*BillingQuery` it returns, and `BillingCollection`. It is never edited by
+`PlanQuery.go` is generated from that declaration: `Plans(db)`, the
+`*PlanQuery` it returns, and `PlanCollection`. It is never edited by
 hand. After changing the struct or the table, run
 
 ```sh
@@ -189,7 +192,7 @@ aru model:build
 and commit what it rewrote. `aru model:build --check` writes nothing and exits 1
 when the file is missing, stale or hand-edited.
 
-Every query starts at `Billings(s.db)`. The constructor returns one mutable
+Every query starts at `Plans(s.db)`. The constructor returns one mutable
 query, so a second chain begun from a value held in a variable carries the
 clauses of the first — and compiles.
 
@@ -209,10 +212,10 @@ protects come as a pair:
 // arandu:begin custom
 
 // CanRename reports whether the record may take this name.
-func (s Billing) CanRename(name string) bool { return name != "" && name != s.Name }
+func (s Plan) CanRename(name string) bool { return name != "" && name != s.Name }
 
 // Rename gives the record a new name, and refuses one it cannot take.
-func (s *Billing) Rename(name string) error {
+func (s *Plan) Rename(name string) error {
 	if !s.CanRename(name) {
 		return fmt.Errorf("billing: %q cannot be the new name of this record", name)
 	}
@@ -223,12 +226,12 @@ func (s *Billing) Rename(name string) error {
 // arandu:end custom
 ```
 
-A local scope is a method on `*BillingQuery` in the same block, and a relation
-is registered on `billingTable` from an `init` function:
+A local scope is a method on `*PlanQuery` in the same block, and a relation
+is registered on `planTable` from an `init` function:
 
 ```go
 // Named narrows the query to the records with this name.
-func (q *BillingQuery) Named(name string) *BillingQuery {
+func (q *PlanQuery) Named(name string) *PlanQuery {
 	return q.Where("name", "=", name)
 }
 ```
@@ -262,16 +265,16 @@ A value out of range is refused rather than clamped. A number somebody wrote and
 did not get is worse than a number somebody wrote and was told about — that is
 why `PageSize` above `MaxPageSize` is an error and not a silent 200.
 
-Add the case to `TestTheConfigurationRefusesWhatCannotWork` at
-`tests/Unit/policy_test.go:298`, which is a map of named bad configurations, and
-to `TestNewRefusesAWiringThatCannotWork` at `tests/Feature/routes_test.go:267`
-if the field can make `New` fail.
+Add the case to `TestTheConfigurationRefusesWhatCannotWork` in
+`tests/Unit/policy_test.go`, which is a map of named bad configurations, and to
+`TestTheModuleDeclaresItsSchemaAndRefusesABadWiring` in
+`tests/Feature/billing_test.go` if the field can make `New` fail.
 
 ## What may leave in a response
 
 `Resource` and `Collection` in `model.go` are declared snapshots, not direct
 encoding of the entity. This also defines the safe copy boundary: Model-backed
-Service results stay as `*Billing`/`[]*Billing`, because a copied row keeps
+Service results stay as `*Plan`/`[]*Plan`, because a copied row keeps
 the model of the original and refuses to be written. A response snapshot reads
 only the explicit fields and cannot be saved.
 
@@ -307,14 +310,15 @@ Append it to the slice `Migrations()` returns, and give it a name that sorts
 after the last one:
 
 ```go
-func (createBillings) GetName() string { return "20260823_0001_create_billings" }
+func (createPlans) GetName() string { return "20261023_0001_create_billing_plans" }
 ```
 
-**The name carries the order and nothing else does.** `TestTheModuleDeclaresItsSchema`
-at `tests/Feature/routes_test.go:301` requires the returned names to be sorted,
-requires none to be empty, and requires every one to satisfy
-`migrations.ReversibleMigration` — the migrator finds `Down` by type assertion,
-so a `Down` with the wrong signature is a rollback that silently does nothing.
+**The name carries the order and nothing else does.** `TestTheModuleDeclaresItsSchemaAndRefusesABadWiring`
+in `tests/Feature/billing_test.go` holds the names in order, and every
+migration is asserted beside it as a `migrations.ReversibleMigration` -- the
+migrator finds `Down` by type assertion, so a `Down` with the wrong signature is
+a rollback that silently does nothing. Name every new migration in the
+CHANGELOG entry of the release that adds it; the release suite checks.
 
 Three rules the existing migration keeps:
 

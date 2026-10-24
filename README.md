@@ -4,34 +4,60 @@
 
 # Arandu Billing
 
-An Arandu package. It registers its own routes, owns its own table, and decides
-for itself who may reach either.
+Billing management for an Arandu application: a catalogue of plans and
+coupons, the subscriptions of each account and the date each one is paid
+until, and the invoices a payment gateway collects -- with the admin's screens
+and the customer's, in English and Brazilian Portuguese.
+
+It ships **no payment gateway**. The application implements the `Provider`
+interface as a service of its own, over its gateway's client and its own
+merchant account, and hands it to `New`. The package asks it for a checkout
+page, believes a notification only after asking it again, and confirms each
+invoice once. Balances are not kept here: a plan that sells credits deposits
+them in [arandu-wallet](https://github.com/hyz-is/arandu-wallet) through the
+optional `walletcredit` listener.
 
 ## Install
 
 ```bash
-go get github.com/hyz-is/arandu-billing
+go get github.com/hyz-is/arandu-billing@v0.1.0
 ```
 
 ## Wire it
 
-An Arandu application registers a module explicitly. There is no service
-provider, no container and no discovery, so these are the lines to paste into
-`bootstrap/app.go` and there are no others.
+An Arandu application registers a module explicitly, in `bootstrap/app.go`.
+These are the lines, and there are no others.
 
-The import, with the other module imports:
+The imports:
 
 ```go
 import (
 	billing "github.com/hyz-is/arandu-billing"
+
+	"your/module/path/app/Services/payments"
 )
 ```
 
-The construction, in `Build`, after the session store exists and before
-`k.Register`:
+The construction, in `Build`, after the session store, the activity log and
+the gateway service exist and before `k.Register`:
 
 ```go
-	billingModule, err := billing.New(billing.Config{}, db, sessions)
+	gateway, err := payments.NewCheckout(cfg.Payments) // the application's own Provider
+	if err != nil {
+		return App{}, err
+	}
+	billingModule, err := billing.New(billing.Config{
+		Prefix:      "/painel",
+		AdminPrefix: "/admin/cobranca",
+		Paths:       billing.PortuguesePaths,
+		Providers:   []billing.Provider{gateway, billing.ManualProvider{Instructions: cfg.PixInstructions}},
+		PublicURL:   cfg.App.URL,
+		Locale:      "pt-BR",
+		Activity:    activityModule.Logger(),
+		Listener:    onBilling, // optional: the application's reaction to each event
+		Customer:    customerOf, // optional: who pays, for the gateway's page
+		Middleware:  []func(http.Handler) http.Handler{permissionModule.Roles()},
+	}, db, sessions)
 	if err != nil {
 		return App{}, err
 	}
@@ -47,186 +73,249 @@ Then, once, before the application serves:
 
 ```bash
 aru migrate
-```
-
-This package owns a table, which is why the migration step is not optional and
-why `arandu.mod.toml` says `migrations = true`.
-
-## Publish the views
-
-This package carries the markup of its own pages and hands it over instead of
-rendering it from the inside, because a page you cannot edit is a page that says
-the wrong thing in your product.
-
-Look at what would be written, then write it:
-
-```bash
-aru vendor:publish --tag=view
 aru vendor:publish --tag=view --apply
-```
-
-Nothing is written without `--apply`. The preview lists every file as `create`,
-`update`, `unchanged` or `conflict`, and running the command a second time
-writes nothing. A file changed outside its `arandu:begin custom` markers is
-reported as a conflict and left alone; `--force` publishes over one, and even
-then what is inside the markers is carried forward.
-
-The files land under `resources/views/modules/billing/`, and from that point
-they are yours. Nothing of this package is compiled beside them, so no view name
-is registered twice and no rule has to decide which of two files won — the
-consequence being that a view of this package that changes later does not reach
-a project that already published it.
-
-Two steps are left to you, and they are left to you because a command that
-edited `bootstrap/app.go` behind your back is a command whose output nobody can
-explain. Compile what was written:
-
-```bash
 aru view:build
 ```
 
-and import the directory it wrote into, with the other imports:
+and import the compiled views beside the other imports:
 
 ```go
 	_ "your/module/path/storage/framework/views/modules/billing"
+	_ "your/module/path/storage/framework/views/modules/billing/admin"
 ```
 
-Without that import the views are not in the binary, and the module refuses to
-boot rather than answering the first request that reaches one of them with a
-500. The refusal names the view, the command and the import.
+Without them the module refuses to boot, and the refusal names the views, the
+command and the imports. An application that mounts the account's routes in
+its customer panel and the admin's in its operator console, each with its own
+guards, calls `billingModule.AccountRoutes(panel)`,
+`billingModule.AdminRoutes(console)` and `billingModule.NotificationRoutes(api)`
+instead of registering the module's `Routes` whole.
+
+## Implement a Provider
+
+A gateway is four methods, written in the application:
+
+```go
+// app/Services/payments/checkout.go
+type Checkout struct{ client *gatewayclient.Client }
+
+func (c *Checkout) Name() string { return "gateway" } // the last segment of its notification address
+
+// CreateCheckout asks the gateway for a payment page for one invoice.
+func (c *Checkout) CreateCheckout(ctx context.Context, req billing.CheckoutRequest) (billing.Checkout, error) {
+	order, err := c.client.CreateOrder(ctx, gatewayclient.Order{
+		Number: req.InvoiceID, Description: req.Description, Amount: req.Total,
+		MaxInstallments: req.MaxInstallments, ReturnURL: req.ReturnURL,
+	})
+	if err != nil {
+		return billing.Checkout{}, err
+	}
+	return billing.Checkout{URL: order.PaymentURL, Reference: order.ID}, nil
+}
+
+// ParseNotification reads what the gateway posted. Nothing in it is trusted:
+// it only names the order.
+func (c *Checkout) ParseNotification(r *http.Request) (billing.Notification, error) {
+	if err := r.ParseForm(); err != nil || r.PostForm.Get("order_number") == "" {
+		return billing.Notification{}, billing.ErrBadNotification
+	}
+	return billing.Notification{InvoiceID: r.PostForm.Get("order_number"), Reference: r.PostForm.Get("checkout_id")}, nil
+}
+
+// QueryStatus asks the gateway itself where the payment stands.
+func (c *Checkout) QueryStatus(ctx context.Context, q billing.StatusQuery) (billing.PaymentStatus, error) {
+	p, err := c.client.Payment(ctx, q.InvoiceID)
+	if err != nil {
+		return billing.PaymentStatus{}, err
+	}
+	state := billing.StatePending
+	switch {
+	case p.Paid:
+		state = billing.StatePaid
+	case p.Denied:
+		state = billing.StateFailed
+	}
+	return billing.PaymentStatus{State: state, Amount: p.Amount, Method: p.Method,
+		Installments: p.Installments, Reference: p.ID, PaidAt: p.PaidAt, Raw: p.Status}, nil
+}
+```
+
+What the package does with the answers is the contract:
+
+- `CreateCheckout` is called once per invoice, after the invoice is saved,
+  with the amount computed here from the catalogue. The customer is sent to
+  `Checkout.URL`; an empty URL shows the invoice page, where a provider that
+  implements `PaymentInstructions() string` tells the customer how to pay.
+- `ParseNotification` runs on `POST NotificationPrefix + "/" + Name()`, with no
+  session and no CSRF token. Its answer only names the invoice (by
+  `InvoiceID`, the order number the checkout was given, or by the gateway's
+  `Reference`); a request it does not understand wraps `ErrBadNotification` and
+  the address answers 400.
+- `QueryStatus` is asked before anything is confirmed. Only `StatePaid` with
+  `Amount` equal to the invoice's total confirms it; another amount answers 409
+  and is kept on the invoice for the admin. `StateFailed` marks the invoice
+  failed.
+- Confirmation is idempotent: the invoice is claimed by a conditional update,
+  and the unique `invoice_id` of the payments holds the same line in the
+  database, so one invoice is paid once however many notifications arrive, in
+  whatever order, racing or not. A repeated notification answers 200.
+
+The customer's return address (`PublicURL` + `/faturas/{id}/retorno` with the
+Portuguese paths) asks the gateway again too, so a payment counts even before
+the notification arrives.
+
+`ManualProvider` is the gateway-free one: no page and no notification; the
+invoice page shows its `Instructions` and the admin confirms the payment on
+the admin's invoices screen. For tests, `billingtest.New("fake")` is an
+in-memory gateway: `Pay`, `Fail` and `Refund` say what happened, and
+`Notification` builds the post.
 
 ## Configuration
 
 | field | required | meaning |
 | --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/billing`. |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200. |
+| `Providers` | yes | the gateways, the application's own; the first is the default |
+| `DefaultProvider` | no | the `Name` of the provider a checkout uses |
+| `Prefix` | no | where the account's routes are mounted. Defaults to `/billing` |
+| `AdminPrefix` | no | where the admin's routes are mounted. Defaults to `Prefix + /admin` |
+| `Paths` | no | the segments of every route; `PortuguesePaths` is the Brazilian set |
+| `NotificationPrefix` | no | where the gateways post. Defaults to `/api/billing/notifications` |
+| `PageSize` | no | rows per page, 25 by default, refused above 200 |
+| `Listener` | no | told about each event, inside the act's transaction |
+| `Customer` | no | who pays, for the gateway's page |
+| `PublicURL` | no | the application's address, for the return address |
+| `Location` | no | the timezone dates are shown in. Defaults to `America/Sao_Paulo` |
+| `Activity` | no | arandu-activitylog's logger: every act is recorded under its Grant |
+| `Translator`, `Locale`, `TitleSeparator` | no | the sentences and the document title |
+| `Middleware`, `AdminMiddleware`, `Chrome` | no | the application's guards and layout |
+| `Clock` | no | the time, for a test that holds it still |
 
-The zero `Config{}` is a valid configuration. There is no tenant to set: every
-route needs a session, and the tenant of every statement is the one on the
-Grant of whoever is signed in.
-
-`New` returns an error rather than starting half-wired, so a setting that
-cannot work fails where it is written instead of on the first request that
-needed it.
+There is no tenant to set and there are no prices to set: the tenant of every
+statement is the one on the Grant, and every number a business person changes
+is a plan's or a coupon's row, written by the application's seeder or on the
+admin's screen.
 
 ## Routes
 
+With `PortuguesePaths`, the account's side under `Prefix`:
+
 | method | path | name |
 | --- | --- | --- |
-| `GET` | `/billing` | `billing.index` |
-| `GET` | `/billing/{id}` | `billing.show` |
-| `POST` | `/billing` | `billing.store` |
+| `GET` | `/planos` | `billing.plans.index` |
+| `POST` | `/planos/{id}/assinar` | `billing.plans.checkout` |
+| `POST` | `/planos/{id}/teste-gratis` | `billing.plans.trial` |
+| `GET` | `/assinaturas` | `billing.subscriptions.index` |
+| `POST` | `/assinaturas/{id}/renovacao` | `billing.subscriptions.renew` |
+| `POST` | `/assinaturas/{id}/cancelamento` | `billing.subscriptions.cancel` |
+| `DELETE` | `/assinaturas/{id}/cancelamento` | `billing.subscriptions.resume` |
+| `GET` | `/faturas` | `billing.invoices.index` |
+| `GET` | `/faturas/{id}` | `billing.invoices.show` |
+| `GET` | `/faturas/{id}/retorno` | `billing.invoices.return` |
 
-Every one of them sits behind `RequireAuth`: a visitor with no session is sent
-to `/auth/login`, and the handler of a request that has one reads who is asking
-with `ctx.User()`. Behind the guard, every route is refused until the policy is
-opened. That is the state the package ships in, and it is deliberate.
+the admin's under `AdminPrefix`: `GET`/`POST /planos`, `GET`/`POST
+/planos/{id}`, `GET`/`POST /cupons`, `POST /cupons/{id}`, `GET /assinaturas`,
+`POST /assinaturas/{id}/cancelamento`, `GET /faturas`, `POST
+/faturas/{id}/pagamento` and `POST /faturas/{id}/cancelamento`; and `POST
+NotificationPrefix/{provider}`, `billing.notifications`.
 
-A handler returns the error the service returned, and the router answers it: a
-policy refusal is 403, a record that is not there is 404, and a rejected input
-goes back where it came from with the messages in the flash. A request that asks
-for JSON gets the same statuses as `application/problem+json` documents, and a
-rejected input as a 422 with the messages keyed by field. No handler maps an
-error to a status itself.
+Every route but the notification sits behind `RequireAuth`: a visitor with no
+session is sent to `/auth/login` (or wherever the application's guard sends
+one), and a handler reads who is asking with `ctx.User()`. A client that asks
+for JSON gets JSON from every route.
 
-## Open the policy
+## Who may do what
 
-`policy.go` denies every action and has no branch that allows one. Open what
-this package needs, one action at a time, inside the custom block:
+| subject | how the application says so | may |
+| --- | --- | --- |
+| a member of an account | signed in to that account | read the plans, the account's subscriptions and invoices |
+| the account's manager | `billing.AccountRole`, or the action `billing.account` through arandu-permission | pay for a plan, start a trial, renew, cancel at the period's end |
+| the platform's admin | `billing.AdminRole`, or the action `billing.admin` | keep the plans and coupons, read every account's subscriptions and invoices, confirm a payment by hand, void an invoice, cancel a subscription at once |
+
+A subject inside somebody else's account through arandu-impersonate is never
+the platform's admin there: it acts as the account. A gateway's notification
+and the clock's sweep run as this package's own system subject, inside the
+invoice's or the subscription's own account.
+
+## The rules
+
+- **Price.** A plan's `Price` is in centavos and buys `IntervalMonths`. A
+  percent coupon takes `Value` basis points off, rounded down to the centavo; a
+  fixed one takes `Value` centavos, never more than the price. A coupon is
+  refused when it is inactive, not yet valid, expired, out of uses, for another
+  plan or above the price (`MinPurchase`). A price taken to zero is confirmed at
+  once, with no gateway.
+- **Recurring coupons.** `Renewals` is how many renewals after the first
+  payment keep the discount; a renewal keeps it even if the coupon was
+  deactivated afterwards. `MaxUses` counts first payments.
+- **Installments.** A plan offers installments from `InstallmentsFrom` months
+  on, one per month of the period, never above `InstallmentsCap` or 12; every
+  checkout tells the gateway its `MaxInstallments`.
+- **Periods.** A first payment buys `[paid, paid + months)`; an early renewal is
+  added to the day already paid until; a payment during the grace (`GraceDays`)
+  extends from the day the period ended; a subscription that ended starts again
+  on the day it is paid. One month after January 31 is the last day of
+  February.
+- **The clock.** `Schedule` runs `SweepDue` every fifteen minutes: a period that
+  ended goes past due inside the grace and expires after it; a subscription
+  whose cancellation was asked for is canceled at the end of its period; a
+  trial that ended without a payment expires.
+
+## Events
+
+`Config.Listener` is told, inside the transaction of the act, about
+`subscription.trial_started`, `invoice.paid`, `subscription.activated`,
+`subscription.renewed`, `subscription.past_due`, `subscription.expired` and
+`subscription.canceled`. Each `Event` carries the subscription, the plan with
+its `Meta`, the invoice when there is one, and the Grant scoped to the
+account. A listener's error rolls the act back, and a gateway's notification
+is then answered with an error and sent again.
+
+A plan that sells credits writes `wallet_slug` and `wallet_amount` in its
+`Meta`, and the application wraps its listener:
 
 ```go
-	// arandu:begin custom
-	if a == BillingView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
+	Listener: walletcredit.Listener(walletModule.Service(), walletcredit.Options{Next: onBilling}),
 ```
 
-What is not written there stays closed, including every action added later.
+The deposit runs as the wallet's operator of the invoice's own account, under
+the idempotency key `billing:invoice:<id>`.
+
+## From the application's own code
+
+`billingModule.Service()` is the use cases, each asking the policy:
+`ServingSubscriptions(ctx, who)` is what a screen asks before opening what a
+plan pays for; `SubscriptionsOf(ctx, g)` answers the same for a Grant the
+application's own policy issued for an account (a job, a sync);
+`Subscribe(ctx, who, billing.SubscribeRequest{PlanID, Reference: "camera:42"})`
+starts a checkout for something inside the account, named by the application.
 
 ## The data path
 
-`Billing` embeds `model.Model`, and `billingTable`, beside it in `model.go`,
-declares its table once. `aru model:build` generates `BillingQuery.go` from
-it: `Billings(db)`, which starts a `*BillingQuery`, and `BillingCollection`.
-The file is committed and never edited by hand; regenerate it after changing
-the entity, and `aru model:build --check` fails when it is out of date.
+Each entity embeds `model.Model`, and its table is declared once in
+`model.go`: `planTable`, `couponTable`, `subscriptionTable`,
+`invoiceTable`, `paymentTable` and `couponUsageTable`. `aru model:build`
+generates `Plans(db)` and its `PlanQuery` into `PlanQuery.go`, and the same for
+the others; the files are committed, never edited by hand, and `aru
+model:build --check` fails when one is stale. `BillingService` owns the
+`*data.DB` and follows `validate -> security.Authorize -> Grant -> Model
+terminal`; handlers never hold the database. The lists of every account read
+`internal/everytenant`, Global read models no application can import, after
+the policy allowed the admin.
 
-`BillingService` owns `*data.DB` and follows
-`validate -> security.Authorize -> Grant -> Model terminal`; handlers never hold
-the database or start a query. Every query starts at `Billings(s.db)`: the
-constructor returns one mutable query, so a second chain begun from a value held
-in a variable would carry the clauses of the first.
+## Migrations
 
-Create builds the row with `Billings(s.db).New()` and writes `TenantID` from
-`data.Tenant(g)`. Find authorizes before reading and again against the row it
-found. List authorizes before building its scoped, allowlisted query. The table
-keeps its default `tenant_id` scope on every terminal.
-
-Terminals return `*Billing` and `[]*Billing`. Keep those pointers: a copy of a
-row keeps the model of the original, and the model refuses to write through it
-with `model.ErrUnwired`. `Resource` and `Collection` are explicit response
-snapshots and do not expose tenant or Model internals.
-
-The rules of the entity itself — an invariant, a derived value, a transition
-such as `Rename` guarded by `CanRename` — go in the custom block of `model.go`,
-as pure methods: no database, no network, no clock read inside, no Grant. The
-service orchestrates: it validates, authorizes, calls those rules and saves
-with the Grant.
-
-There is no CRUD Repository. Add one only for a complex query, read model,
-report, export or raw SQL contract that the generated query cannot express.
-
-## Layout
-
-```
-module.go         registration, routes, handlers and migrations
-config.go         what the application passes in
-model.go          the entity, its table and its own rules, and what it may answer with
-BillingQuery.go  the query aru model:build generates from model.go
-policy.go         who may do what
-service.go        the use cases, and Model access after authorization
-views.go          the files the application takes ownership of
-```
-
-## What is already correct, and has to stay that way
-
-**The policy denies everything.** There is no permit-all branch to delete
-later. The Service calls `security.Authorize` before its first `Billings(db)`
-reach, and every Model terminal requires the Grant that call produced.
-
-**Authorization precedes the Model.** The package audit checks that order in
-every exported Service method. A Model terminal enforces tenant scope; the
-preceding Policy call decides whether the action itself is allowed.
-
-**The tenant comes from `data.Tenant(g)`.** Never from the path, the body, the
-query string or a header. The value on the Grant came from the session; a value
-that arrived with the request is a value the caller chose.
-
-**Who is asking comes from the guard.** `RequireAuth` loads the session once and
-puts the subject on the request; nothing in the module loads it again.
-
-**`arandu.mod.toml` declares what the package does** — network, filesystem,
-exec, migrations — and the suite compares the declaration against what the code
-*calls*, not against what it imports: `net/http` is imported by everything with
-a route and says nothing. A package that says it makes no outbound calls and
-then opens one fails its own tests, and that is the only place the comparison
-happens. `aru doctor` audits the application it is run inside and never loads a
-dependency, so nothing audits an installed package except the package itself.
+`20261023_0001_create_billing_plans`, `20261023_0002_create_billing_coupons`,
+`20261023_0003_create_billing_subscriptions`,
+`20261023_0004_create_billing_invoices`, `20261023_0005_create_billing_payments`
+and `20261023_0006_create_billing_coupon_usages`, applied by `aru migrate`,
+never at boot.
 
 ## Tests
 
 ```bash
-go test -race ./...
+GOWORK=off go test -race -p 2 ./...
+ARANDU_TEST_POSTGRES_DSN="postgres://localhost:5432/arandu_billing_test?sslmode=disable" GOWORK=off go test -race -p 2 ./tests/Feature/
 ```
-
-The denial suite constructs the Service with a nil database, so even building
-`Billings(nil)` would panic. The structural twin reads the allowed path and
-rejects any Service method that reaches the Model before `Authorize`, and any
-handler that loads the session or picks a status itself. The route tests drive
-the module with no session, with a signed-in subject and with a rejected input,
-on that same handle over no database.
 
 ## Licence
 

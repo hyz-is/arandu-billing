@@ -163,9 +163,22 @@ func readArchive() (paths, names []string) {
 
 // viewName turns an archive path into the name the view is registered under.
 //
-//	resources/views/modules/billing/index.kyse.go -> modules.billing.index
+//	resources/views/modules/billing/plans.kyse.go -> modules.billing.plans
 func viewName(path string) string {
 	name := strings.TrimPrefix(strings.TrimPrefix(path, viewRoot), "/")
 	name = strings.TrimSuffix(name, viewSuffix)
 	return strings.ReplaceAll(name, "/", ".")
 }
+
+// The screens this package renders, by the name their path gives them.
+const (
+	ViewPlans              = "modules.billing.plans"
+	ViewSubscriptions      = "modules.billing.subscriptions"
+	ViewInvoices           = "modules.billing.invoices"
+	ViewInvoice            = "modules.billing.invoice"
+	ViewAdminPlans         = "modules.billing.admin.plans"
+	ViewAdminPlan          = "modules.billing.admin.plan"
+	ViewAdminCoupons       = "modules.billing.admin.coupons"
+	ViewAdminSubscriptions = "modules.billing.admin.subscriptions"
+	ViewAdminInvoices      = "modules.billing.admin.invoices"
+)

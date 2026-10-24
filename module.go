@@ -1,20 +1,30 @@
-// Package billing is an Arandu module: one entity with its generated query, one
-// policy that decides about it, one service that orchestrates each use case, and
-// the routes that reach them.
+// Package billing is an Arandu module for billing management: a catalogue of
+// plans and coupons, the subscriptions of each account and the date each one
+// is paid until, and the invoices a payment gateway collects.
 //
-// The files are laid out by role rather than by layer, so the whole package
-// reads top to bottom:
+// It ships no gateway. An application implements Provider as a service of its
+// own -- over its gateway's client and its own merchant account -- and hands
+// it to New; the package asks it for a checkout page, believes a notification
+// only after asking it again, and confirms each invoice once. Balances are not
+// kept here: an application that turns a payment into credits deposits them
+// in arandu-wallet from its Listener.
 //
-//	module.go      -> registration, routes, handlers and migrations
-//	config.go      -> what the application passes in
-//	model.go       -> the entity, and what it may answer with
-//	policy.go      -> who may do what
-//	service.go     -> the use cases, and Model access after authorization
-//	views.go       -> the files the application takes ownership of
+// The files are laid out by role rather than by layer:
+//
+//	module.go         -> registration, routes, handlers and migrations
+//	notifications.go  -> the gateways' notification address
+//	config.go         -> what the application passes in
+//	paths.go          -> the addresses, and the route table
+//	model.go          -> the entities, and their own rules
+//	pricing.go        -> what a period costs, and what the clock does to it
+//	provider.go       -> the gateway contract, and the gateway-free provider
+//	policy.go         -> who may do what
+//	*_service.go      -> the use cases, and Model access after authorization
+//	listing.go        -> the server-side pages the data tables read
+//	views.go          -> the files the application takes ownership of
 //
 // An application registers it explicitly. There is no service provider, no
-// container and no discovery: the wiring is three lines somebody wrote, and
-// reading them is how they learn what the application is made of.
+// container and no discovery.
 package billing
 
 import (
@@ -22,30 +32,22 @@ import (
 	"errors"
 	"fmt"
 	stdhttp "net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/arandu-io/framework/data"
 	"github.com/arandu-io/framework/foundation"
 	fhttp "github.com/arandu-io/framework/http"
 	"github.com/arandu-io/framework/http/middleware"
 	"github.com/arandu-io/framework/security"
+	"github.com/arandu-io/framework/validation"
 	"github.com/arandu-io/hesape/database/migrations"
 	"github.com/arandu-io/hesape/database/schema"
-	"github.com/arandu-io/hesape/view"
+	hview "github.com/arandu-io/hesape/view"
 )
 
 // Module is what the application registers.
-//
-// It implements foundation.Module, which is Name and Routes and nothing else --
-// that pair is the whole public contract between a package and the framework.
-//
-// It also implements foundation.Migratable, because it owns a table, and
-// foundation.Publishable, because it hands view sources to the project. The
-// other optional interfaces are declared beside Module in the framework and are
-// opted into the same way, by implementing them: Bootable to prepare state at
-// boot, Background to run a loop of its own, Schedulable to declare work for
-// the scheduler, Health to report on the storage it depends on, Closable to
-// give resources back at shutdown.
 type Module struct {
 	cfg      Config
 	svc      *BillingService
@@ -61,84 +63,154 @@ var (
 )
 
 // New returns the module, or the reason it cannot be built.
-//
-// The collaborators are parameters and not fields somebody fills in afterwards:
-// a module that could be registered half-wired is a module whose first request
-// is the thing that reports the missing half.
-//
-// It returns an error rather than panicking or carrying on, because everything
-// it refuses is a wiring mistake, and a wiring mistake found at boot costs one
-// restart. The same mistake found later is a request that reached a nil handle.
 func New(cfg Config, db *data.DB, sessions *security.SessionStore) (*Module, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	if db == nil {
-		return nil, errors.New("billing: New needs a database handle: this package owns a table, and there is no in-memory mode that would let it start without one")
+		return nil, errors.New("billing: New needs a database handle: this package owns its tables, and there is no in-memory mode that would let it start without one")
 	}
 	if sessions == nil {
-		return nil, errors.New("billing: New needs a session store: every route is mounted behind RequireAuth, which reads it to admit a request and to put who is asking on it")
+		return nil, errors.New("billing: New needs a session store: every route of an account is mounted behind RequireAuth, which reads it")
 	}
 	cfg = cfg.withDefaults()
-	return &Module{
-		cfg:      cfg,
-		svc:      NewBillingService(db),
-		sessions: sessions,
-	}, nil
+	svc := NewBillingService(db)
+	svc.useProviders(cfg.Providers, cfg.DefaultProvider)
+	svc.listener = cfg.Listener
+	svc.customer = cfg.Customer
+	svc.activity = cfg.Activity
+	if cfg.Clock != nil {
+		clock := cfg.Clock
+		svc.now = func() time.Time { return clock().UTC() }
+	}
+	m := &Module{cfg: cfg, svc: svc, sessions: sessions}
+	if cfg.PublicURL != "" {
+		u := m.URLs()
+		svc.returnURL = func(id string) string { return cfg.PublicURL + u.Return(id) }
+	}
+	labels := m.Labels(cfg.Locale)
+	svc.describe = func(event string) string { return labels.T("activity." + strings.ReplaceAll(event, ".", "_")) }
+	svc.labels = func(ctx context.Context) Labels { return m.Labels(m.locale(ctx)) }
+	return m, nil
 }
 
-// Name is the module identifier: a lowercase slug, stable, no spaces.
-//
-// It is what `aru route:list` groups by and what the route names are prefixed with,
-// so changing it changes addresses that other code has already written down.
+// Service is the use cases, for an application that calls them from its own
+// code: its own pages, a job, the engine's sync. Every method asks the
+// policy, so handing it out opens nothing.
+func (m *Module) Service() *BillingService { return m.svc }
+
+// Name is the module identifier.
 func (m *Module) Name() string { return "billing" }
 
-// Routes registers the module's routes under the configured prefix.
-//
-// They are named, so a URL is built from a name rather than written out a
-// second time somewhere else -- two spellings of one address disagree, and the
-// failure when they do is a link to a 404.
-//
-// Every route needs somebody signed in, so the guard is mounted once, on the
-// router they are registered on, rather than route by route: r is replaced by
-// the guarded group before the first registration, and no unguarded router is
-// left in scope for the next route to be added to. RequireAuth sends a request
-// with no session to the sign-in screen, and puts the subject of one that has a
-// session on its context, where a handler reads it with ctx.User.
+// Routes registers every route of the module: the account's, the admin's and
+// the gateways' notification address.
 func (m *Module) Routes(r *fhttp.Router) {
-	r = r.Group("", middleware.RequireAuth(m.sessions))
+	m.AccountRoutes(r)
+	m.AdminRoutes(r)
+	m.NotificationRoutes(r)
+}
 
-	r.Action(stdhttp.MethodGet, m.cfg.Prefix, m.index).Name("billing.index")
-	r.Action(stdhttp.MethodGet, m.cfg.Prefix+"/{id}", m.show).Name("billing.show")
-	r.Action(stdhttp.MethodPost, m.cfg.Prefix, m.store).Name("billing.store")
+// AccountRoutes registers the account's routes alone, under Prefix, for an
+// application that mounts them inside its own customer panel with that side's
+// guards on r.
+func (m *Module) AccountRoutes(r *fhttp.Router) { m.register(r, false) }
+
+// AdminRoutes registers the admin's routes alone, under AdminPrefix, for an
+// application that mounts them inside its operator console.
+func (m *Module) AdminRoutes(r *fhttp.Router) { m.register(r, true) }
+
+func (m *Module) register(r *fhttp.Router, admin bool) {
+	guards := []fhttp.Middleware{middleware.RequireAuth(m.sessions)}
+	for _, mw := range m.cfg.Middleware {
+		guards = append(guards, mw)
+	}
+	if admin {
+		for _, mw := range m.cfg.AdminMiddleware {
+			guards = append(guards, mw)
+		}
+	}
+	r = r.Group("", guards...)
+	handlers := m.handlers()
+	for _, rt := range routeTable(m.cfg) {
+		if rt.admin != admin {
+			continue
+		}
+		r.Action(rt.method, rt.path, m.localized(handlers[rt.name])).Name(rt.name)
+	}
+}
+
+// handlers are the handlers of the route table, by route name.
+func (m *Module) handlers() map[string]func(*fhttp.Context) error {
+	return map[string]func(*fhttp.Context) error{
+		"billing.plans.index":                m.plans,
+		"billing.plans.checkout":             m.checkout,
+		"billing.plans.trial":                m.trial,
+		"billing.subscriptions.index":        m.subscriptions,
+		"billing.subscriptions.renew":        m.renew,
+		"billing.subscriptions.cancel":       m.cancel,
+		"billing.subscriptions.resume":       m.resume,
+		"billing.invoices.index":             m.invoices,
+		"billing.invoices.show":              m.invoice,
+		"billing.invoices.return":            m.returned,
+		"billing.admin.plans.index":          m.adminPlans,
+		"billing.admin.plans.store":          m.storePlan,
+		"billing.admin.plans.edit":           m.editPlan,
+		"billing.admin.plans.update":         m.updatePlan,
+		"billing.admin.coupons.index":        m.adminCoupons,
+		"billing.admin.coupons.store":        m.storeCoupon,
+		"billing.admin.coupons.update":       m.updateCoupon,
+		"billing.admin.subscriptions.index":  m.adminSubscriptions,
+		"billing.admin.subscriptions.cancel": m.adminCancel,
+		"billing.admin.invoices.index":       m.adminInvoices,
+		"billing.admin.invoices.confirm":     m.adminConfirm,
+		"billing.admin.invoices.cancel":      m.adminVoid,
+	}
+}
+
+// screen is what every page of this package is drawn with.
+func (m *Module) screen(ctx *fhttp.Context, who security.Subject, titleKey string, admin bool) (Screen, error) {
+	labels := m.Labels(m.locale(ctx.Ctx()))
+	title := labels.T(titleKey)
+	page := hview.New(ctx, title)
+	page.Title = m.documentTitle(title, page.AppName)
+	page.Authenticated = who.ID != ""
+	sc := Screen{Page: page, Labels: labels, URLs: m.URLs(), loc: m.cfg.Location}
+	if m.cfg.Chrome != nil {
+		chrome, err := m.cfg.Chrome(ctx, ChromeRequest{Title: title, Admin: admin, Subject: who, Page: page})
+		if err != nil {
+			return Screen{}, err
+		}
+		sc.chrome = chrome
+	}
+	return sc, nil
+}
+
+// documentTitle is what the browser tab shows for a screen.
+func (m *Module) documentTitle(title, appName string) string {
+	if m.cfg.TitleSeparator == "" || strings.TrimSpace(appName) == "" {
+		return title
+	}
+	return title + m.cfg.TitleSeparator + appName
+}
+
+// localized answers a rejected input in the request's language.
+func (m *Module) localized(handler func(*fhttp.Context) error) func(*fhttp.Context) error {
+	return func(ctx *fhttp.Context) error {
+		err := handler(ctx)
+		var errs validation.Errors
+		if err == nil || !errors.As(err, &errs) {
+			return err
+		}
+		return m.Labels(m.locale(ctx.Ctx())).Errors(errs)
+	}
 }
 
 // PublishCommand is what an application runs to take ownership of the views
 // this package offers.
-//
-// It is spelled out as a constant so that whatever says it -- the refusal
-// below, or a message an application writes for its own operators -- says one
-// thing. A person who is told two different commands for one job tries both.
-//
-// The command reads the modules the application registered and writes what each
-// one declares, which is why it is the application's command and not this
-// package's: nothing outside the application knows which modules it holds.
 const PublishCommand = "aru vendor:publish --apply"
 
-// Boot refuses to serve when a view this package renders is not in the binary.
-//
-// A compiled view registers itself from init(), so by the time anything boots
-// the question has one answer already: either the application published the
-// files, compiled them and imported the package they became, or it did not.
-// Asking here turns "did anybody run the install command" into one refusal at
-// start-up that names the views and the command, instead of a 500 on the first
-// request that reached one of them -- which is where it used to be answered,
-// once per page, to whoever happened to open it.
-//
-// It also holds the destination. Every file the archive offers has to land
-// under the module directory named after this module: an archive that reached
-// resources/views/home.kyse.go would land on a page the application wrote, and
-// what publishes the files writes what the archive says.
+// Boot refuses to serve when a view this package renders is not in the binary,
+// or when the archive would publish a file outside the module's directory.
 func (m *Module) Boot(context.Context) error {
 	prefix := viewRoot + "/" + moduleDir + "/" + m.Name() + "/"
 	var stray []string
@@ -151,145 +223,821 @@ func (m *Module) Boot(context.Context) error {
 		return fmt.Errorf("billing: %s would be published outside %s, where it lands on a file the application wrote",
 			strings.Join(stray, ", "), prefix)
 	}
-
 	registered := make(map[string]bool)
-	for _, name := range view.Registered() {
+	for _, name := range hview.Registered() {
 		registered[name] = true
 	}
-	var missing []string
+	var missingViews []string
 	for _, name := range ViewNames() {
 		if !registered[name] {
-			missing = append(missing, name)
+			missingViews = append(missingViews, name)
 		}
 	}
-	if len(missing) > 0 {
-		// The compiled packages are named because the import is the half of the
-		// install nothing else can do: the command writes the sources, the view
-		// compiler turns them into Go, and a package the application does not
-		// import is not linked at all.
+	if len(missingViews) > 0 {
 		imports := make([]string, 0, len(ViewPackages()))
 		for _, pkg := range ViewPackages() {
 			imports = append(imports, "<module path>/"+pkg)
 		}
 		return fmt.Errorf("billing: no view is registered as %s. Run `%s`, then `aru view:build`, then import %s in bootstrap/app.go",
-			strings.Join(missing, ", "), PublishCommand, strings.Join(imports, ", "))
+			strings.Join(missingViews, ", "), PublishCommand, strings.Join(imports, ", "))
 	}
 	return nil
 }
 
-// Handlers are thin on purpose: read the input, ask the service, answer. No
-// rule, database handle or Model construction lives here. A handler that
-// reached data directly would skip the service's policy boundary, and the
-// layout makes that visible rather than relying on review.
-//
-// Who is asking comes from ctx.User, which reads the subject RequireAuth put on
-// the request. No handler loads the session again or takes an identity from the
-// input. The second value ctx.User answers is not consulted: behind the guard
-// there is always a subject, and were there none, the zero subject it answers
-// would be refused by security.Authorize before any policy ran.
-//
-// An error from the service is returned as it is, and the router answers it:
-// validation.Errors goes back where the request came from with the messages in
-// the flash, ErrNotFound is 404 because it wraps model.ErrModelNotFound, and a
-// policy refusal is 403. The answer is the status and its standard sentence,
-// never the error's own text -- telling a client why a policy said no tells it
-// what exists, one request at a time, and the reason belongs in the log. Any
-// other error is one nobody expected, and it reaches the error page rather than
-// a 200 with an empty body.
+// Schedule declares the sweep that moves the subscriptions whose period
+// ended: every fifteen minutes, on one replica.
+func (m *Module) Schedule() []foundation.Task {
+	return []foundation.Task{{
+		ID:        "billing.sweep",
+		Spec:      "*/15 * * * *",
+		Scope:     foundation.Global,
+		Timeout:   10 * time.Minute,
+		Singleton: true,
+		Action:    SubscriptionsSweep,
+		Run: func(ctx context.Context, _ security.Grant) error {
+			_, err := m.svc.SweepDue(ctx, time.Now())
+			return err
+		},
+	}}
+}
 
-// index answers a page of records.
-func (m *Module) index(ctx *fhttp.Context) error {
-	query := data.Query{
-		Sort:   ctx.Query("sort"),
-		Cursor: ctx.Query("cursor"),
-		Limit:  m.cfg.PageSize,
+// Handlers are thin on purpose: read the input, ask the service, answer. Who
+// is asking comes from ctx.User, which reads the subject RequireAuth put on
+// the request. An error from the service is returned as it is, and the router
+// answers it.
+
+// pageQuery reads a data table's query string.
+func (m *Module) pageQuery(ctx *fhttp.Context) PageQuery {
+	page, _ := strconv.Atoi(ctx.Query("page"))
+	perPage, _ := strconv.Atoi(ctx.Query("per_page"))
+	return PageQuery{
+		Search: ctx.Query("q"), Status: ctx.Query("status"), Sort: ctx.Query("sort"), Dir: ctx.Query("dir"),
+		Page: page, PerPage: perPage,
 	}
+}
 
+// plans is the catalogue, as an account reads it.
+func (m *Module) plans(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
-	records, err := m.svc.List(ctx.Ctx(), who, query)
+	rows, err := m.svc.ActivePlans(ctx.Ctx(), who)
 	if err != nil {
 		return err
 	}
-
-	// A full page is the only one that can have a successor. A short page is
-	// the last one, and offering a cursor for it would be offering a next page
-	// that comes back empty.
-	cursor := ""
-	if len(records) == m.cfg.PageSize {
-		cursor = records[len(records)-1].ID
+	if ctx.WantsJSON() {
+		items := make([]map[string]any, 0, len(rows))
+		for _, p := range rows {
+			items = append(items, NewPlanResource(*p).ToArray())
+		}
+		return ctx.JSON(stdhttp.StatusOK, list{items: items, total: len(items)})
 	}
-	return ctx.JSON(stdhttp.StatusOK, collectionFromPointers(records, cursor))
-}
-
-// show answers one record.
-func (m *Module) show(ctx *fhttp.Context) error {
-	who, _ := ctx.User()
-	record, err := m.svc.Find(ctx.Ctx(), who, ctx.Param("id"))
+	sc, err := m.screen(ctx, who, "screen.plans_title", false)
 	if err != nil {
 		return err
 	}
-	return ctx.JSON(stdhttp.StatusOK, resourceFromPointer(record))
+	return ctx.View(ViewPlans, PlansPageData{Screen: sc, Plans: planCards(sc, rows), CanSubscribe: IsAccountManager(who)})
 }
 
-// store creates one record.
-func (m *Module) store(ctx *fhttp.Context) error {
-	in := CreateRequest{Name: ctx.Input("name")}
-
+// checkout pays for one plan, with the coupon typed.
+func (m *Module) checkout(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
-	record, err := m.svc.Create(ctx.Ctx(), who, in)
+	result, err := m.svc.Subscribe(ctx.Ctx(), who, SubscribeRequest{PlanID: ctx.Param("id"), CouponCode: ctx.Input("coupon")})
 	if err != nil {
 		return err
 	}
-	return ctx.JSON(stdhttp.StatusCreated, resourceFromPointer(record))
+	return m.sendToPayment(ctx, result)
 }
 
-// Migrations declares the schema this module owns.
-//
-// They are returned in the order their names sort in, which is the order they
-// apply in: the name carries the order, and nothing else decides it.
-func (m *Module) Migrations() []foundation.Migration {
-	return []foundation.Migration{createBillings{}}
+// sendToPayment answers an issued invoice: the gateway's page, or the
+// invoice's own.
+func (m *Module) sendToPayment(ctx *fhttp.Context, result *CheckoutResult) error {
+	if ctx.WantsJSON() {
+		fields := NewInvoiceResource(*result.Invoice).ToArray()
+		fields["url"] = result.URL
+		return ctx.JSON(stdhttp.StatusCreated, fieldsResource(fields))
+	}
+	if result.URL != "" {
+		return ctx.Redirect(result.URL)
+	}
+	return ctx.Redirect(m.URLs().Invoice(result.Invoice.ID))
 }
 
-// The migration is reversible, and the assertion is here rather than discovered
-// at rollback: the migrator tests for Down with a type assertion, so a Down
-// with the wrong signature would leave a rollback that silently does nothing.
-var _ migrations.ReversibleMigration = createBillings{}
+// trial starts one plan's trial.
+func (m *Module) trial(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	sub, err := m.svc.StartTrial(ctx.Ctx(), who, ctx.Param("id"), "")
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusCreated, NewSubscriptionResource(*sub))
+	}
+	return ctx.Redirect(m.URLs().Subscriptions())
+}
 
-// createBillings is the table this module owns, and the index its listing
-// reads by.
-type createBillings struct{ migrations.BaseMigration }
-
-// GetName is the migration's identity, and it carries the order. It is fixed
-// once the package is published: changing what an applied name means leaves the
-// change missing everywhere it already ran, and nothing says so.
-func (createBillings) GetName() string { return "20260823_0001_create_billings" }
-
-// Up creates the table and the index the keyset pagination scans.
-//
-// The Blueprint spells each column for the engine the migration is running on,
-// which is what lets one application develop on a file and deploy on Postgres
-// without a second schema. That used to be written out as SQL here, with a
-// comment explaining that an identifier column is VARCHAR rather than TEXT
-// because it takes part in a key and MySQL refuses TEXT in one without a prefix
-// length -- which is the grammar's job, done by hand in every migration that
-// remembered to.
-//
-// The timestamp has no database default: the value comes from Go.
-func (createBillings) Up(ctx context.Context, conn migrations.Connection) error {
-	return conn.Schema().Create(ctx, "billings", func(table *schema.Blueprint) {
-		table.String("id").Primary()
-		table.String("tenant_id")
-		table.String("name")
-		table.Timestamp("created_at")
-
-		// The index matches the ORDER BY of the listing, tenant first. Without
-		// it every page is a scan of every customer's rows.
-		table.Index([]string{"tenant_id", "created_at", "id"}, "billings_tenant_created_idx")
+// subscriptions are the account's subscriptions, a page at a time.
+func (m *Module) subscriptions(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	q := m.pageQuery(ctx)
+	page, err := m.svc.SubscriptionsPage(ctx.Ctx(), who, q, m.cfg.PageSize)
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, subscriptionsList(page))
+	}
+	names, err := m.svc.PlanNames(ctx.Ctx(), who)
+	if err != nil {
+		return err
+	}
+	sc, err := m.screen(ctx, who, "screen.subscriptions_title", false)
+	if err != nil {
+		return err
+	}
+	return ctx.View(ViewSubscriptions, SubscriptionsPageData{
+		Screen: sc, Rows: subscriptionRows(sc, page.Rows, names), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().Subscriptions()),
+		CanManage: IsAccountManager(who),
 	})
 }
 
-// Down drops the table, which takes its index with it.
-func (createBillings) Down(ctx context.Context, conn migrations.Connection) error {
-	return conn.Schema().DropIfExists(ctx, "billings")
+// renew pays the next period of one subscription.
+func (m *Module) renew(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	result, err := m.svc.Renew(ctx.Ctx(), who, ctx.Param("id"), "")
+	if err != nil {
+		return err
+	}
+	return m.sendToPayment(ctx, result)
+}
+
+// cancel asks one subscription to stop at the end of its period.
+func (m *Module) cancel(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	sub, err := m.svc.CancelAtPeriodEnd(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewSubscriptionResource(*sub))
+	}
+	return ctx.Redirect(m.URLs().Subscriptions())
+}
+
+// resume takes a cancellation back.
+func (m *Module) resume(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	sub, err := m.svc.ResumeSubscription(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewSubscriptionResource(*sub))
+	}
+	return ctx.Redirect(m.URLs().Subscriptions())
+}
+
+// invoices are the account's invoices, a page at a time.
+func (m *Module) invoices(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	q := m.pageQuery(ctx)
+	page, err := m.svc.InvoicesPage(ctx.Ctx(), who, q, m.cfg.PageSize)
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, invoicesList(page.Rows, page.Total))
+	}
+	sc, err := m.screen(ctx, who, "screen.invoices_title", false)
+	if err != nil {
+		return err
+	}
+	return ctx.View(ViewInvoices, InvoicesPageData{
+		Screen: sc, Rows: invoiceRows(sc, page.Rows, false), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().Invoices()),
+	})
+}
+
+// invoice is one of the account's invoices, with how to pay it.
+func (m *Module) invoice(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	inv, err := m.svc.Invoice(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewInvoiceResource(*inv))
+	}
+	sc, err := m.screen(ctx, who, "screen.invoice_title", false)
+	if err != nil {
+		return err
+	}
+	rows := invoiceRows(sc, []*Invoice{inv}, false)
+	return ctx.View(ViewInvoice, InvoicePageData{Screen: sc, Invoice: rows[0], Instructions: m.svc.instructions(inv)})
+}
+
+// returned is where the gateway sends the customer back: the gateway is asked
+// again, and the invoice is shown as it stands.
+func (m *Module) returned(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	inv, err := m.svc.RefreshInvoice(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewInvoiceResource(*inv))
+	}
+	return ctx.Redirect(m.URLs().Invoice(inv.ID))
+}
+
+// adminPlans is the catalogue, for the admin, with the form that adds a plan.
+func (m *Module) adminPlans(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	q := m.pageQuery(ctx)
+	page, err := m.svc.PlansPage(ctx.Ctx(), who, q, m.cfg.PageSize)
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		items := make([]map[string]any, 0, len(page.Rows))
+		for _, p := range page.Rows {
+			items = append(items, NewPlanResource(*p).ToArray())
+		}
+		return ctx.JSON(stdhttp.StatusOK, list{items: items, total: page.Total})
+	}
+	sc, err := m.screen(ctx, who, "screen.admin_plans_title", true)
+	if err != nil {
+		return err
+	}
+	return ctx.View(ViewAdminPlans, AdminPlansPageData{
+		Screen: sc, Rows: planRows(sc, page.Rows), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().AdminPlans()),
+		StoreURL: m.URLs().AdminPlans(), NewPlan: PlanForm{Active: true, IntervalMonths: "1", InstallmentsCap: strconv.Itoa(MaxInstallments)},
+	})
+}
+
+// planRequest reads a plan's form.
+func planRequest(ctx *fhttp.Context) (PlanRequest, error) {
+	price, ok := parseReais(ctx.Input("price_brl"))
+	if !ok && ctx.Input("price") != "" {
+		price, _ = strconv.ParseInt(strings.TrimSpace(ctx.Input("price")), 10, 64)
+		ok = true
+	}
+	if !ok {
+		return PlanRequest{}, validation.Errors{"price_brl": {message("amount")}}
+	}
+	meta, err := parseMeta(ctx.Input("meta"))
+	if err != nil {
+		return PlanRequest{}, validation.Errors{"meta": {message("meta_lines")}}
+	}
+	return PlanRequest{
+		Slug: ctx.Input("slug"), Name: ctx.Input("name"), Description: ctx.Input("description"),
+		Features: strings.Split(ctx.Input("features"), "\n"), Price: price,
+		IntervalMonths: atoi(ctx.Input("interval_months")), TrialDays: atoi(ctx.Input("trial_days")),
+		GraceDays: atoi(ctx.Input("grace_days")), InstallmentsFrom: atoi(ctx.Input("installments_from")),
+		InstallmentsCap: atoi(ctx.Input("installments_cap")), Meta: meta,
+		Active: checked(ctx.Input("active")), Position: atoi(ctx.Input("position")),
+	}, nil
+}
+
+// storePlan adds a plan.
+func (m *Module) storePlan(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	in, err := planRequest(ctx)
+	if err != nil {
+		return err
+	}
+	p, err := m.svc.CreatePlan(ctx.Ctx(), who, in)
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusCreated, NewPlanResource(*p))
+	}
+	return ctx.Redirect(m.URLs().AdminPlans())
+}
+
+// editPlan is one plan, with the form that changes it.
+func (m *Module) editPlan(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	p, err := m.svc.Plan(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewPlanResource(*p))
+	}
+	sc, err := m.screen(ctx, who, "screen.admin_plan_title", true)
+	if err != nil {
+		return err
+	}
+	return ctx.View(ViewAdminPlan, AdminPlanPageData{Screen: sc, Plan: planForm(*p), UpdateURL: m.URLs().AdminPlan(p.ID), BackURL: m.URLs().AdminPlans()})
+}
+
+// updatePlan changes a plan.
+func (m *Module) updatePlan(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	in, err := planRequest(ctx)
+	if err != nil {
+		return err
+	}
+	p, err := m.svc.UpdatePlan(ctx.Ctx(), who, ctx.Param("id"), in)
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewPlanResource(*p))
+	}
+	return ctx.Redirect(m.URLs().AdminPlans())
+}
+
+// adminCoupons are the coupons, with the form that adds one.
+func (m *Module) adminCoupons(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	q := m.pageQuery(ctx)
+	page, err := m.svc.CouponsPage(ctx.Ctx(), who, q, m.cfg.PageSize)
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		items := make([]map[string]any, 0, len(page.Rows))
+		for _, c := range page.Rows {
+			items = append(items, NewCouponResource(*c).ToArray())
+		}
+		return ctx.JSON(stdhttp.StatusOK, list{items: items, total: page.Total})
+	}
+	names, err := m.svc.PlanNames(ctx.Ctx(), who)
+	if err != nil {
+		return err
+	}
+	sc, err := m.screen(ctx, who, "screen.admin_coupons_title", true)
+	if err != nil {
+		return err
+	}
+	return ctx.View(ViewAdminCoupons, AdminCouponsPageData{
+		Screen: sc, Rows: couponRows(sc, page.Rows, names), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().AdminCoupons()),
+		StoreURL: m.URLs().AdminCoupons(), PlanOptions: planOptions(sc, names),
+	})
+}
+
+// storeCoupon adds a coupon.
+func (m *Module) storeCoupon(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	in, err := m.couponRequest(ctx)
+	if err != nil {
+		return err
+	}
+	c, err := m.svc.CreateCoupon(ctx.Ctx(), who, in)
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusCreated, NewCouponResource(*c))
+	}
+	return ctx.Redirect(m.URLs().AdminCoupons())
+}
+
+// updateCoupon switches a coupon on or off.
+func (m *Module) updateCoupon(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	c, err := m.svc.SetCouponActive(ctx.Ctx(), who, ctx.Param("id"), checked(ctx.Input("active")))
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewCouponResource(*c))
+	}
+	return ctx.Redirect(m.URLs().AdminCoupons())
+}
+
+// couponRequest reads a coupon's form. The value is typed as a percentage
+// ("10" or "12,5") for a percent coupon and as reais for a fixed one: two
+// decimals either way, which is basis points or centavos.
+func (m *Module) couponRequest(ctx *fhttp.Context) (CouponRequest, error) {
+	value, ok := parseReais(ctx.Input("value"))
+	if !ok {
+		return CouponRequest{}, validation.Errors{"value": {message("amount")}}
+	}
+	minimum := int64(0)
+	if raw := ctx.Input("min_purchase_brl"); strings.TrimSpace(raw) != "" {
+		if minimum, ok = parseReais(raw); !ok {
+			return CouponRequest{}, validation.Errors{"min_purchase_brl": {message("amount")}}
+		}
+	}
+	from, err := m.dayStart(ctx.Input("valid_from"), 0)
+	if err != nil {
+		return CouponRequest{}, validation.Errors{"valid_from": {message("date")}}
+	}
+	until, err := m.dayStart(ctx.Input("valid_until"), 1)
+	if err != nil {
+		return CouponRequest{}, validation.Errors{"valid_until": {message("date")}}
+	}
+	return CouponRequest{
+		Code: ctx.Input("code"), Description: ctx.Input("description"), Kind: CouponKind(ctx.Input("kind")),
+		Value: value, MaxUses: atoi(ctx.Input("max_uses")), Renewals: atoi(ctx.Input("renewals")),
+		MinPurchase: minimum, PlanID: ctx.Input("plan_id"), ValidFrom: from, ValidUntil: until,
+		Active: checked(ctx.Input("active")),
+	}, nil
+}
+
+// dayStart is the first instant of a day typed as YYYY-MM-DD, in the
+// application's timezone, moved by days days; nil for an empty field.
+func (m *Module) dayStart(raw string, days int) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	day, err := time.ParseInLocation("2006-01-02", raw, m.cfg.Location)
+	if err != nil {
+		return nil, err
+	}
+	t := day.AddDate(0, 0, days).UTC()
+	return &t, nil
+}
+
+// adminSubscriptions are every account's subscriptions.
+func (m *Module) adminSubscriptions(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	q := m.pageQuery(ctx)
+	page, err := m.svc.AllSubscriptionsPage(ctx.Ctx(), who, q, m.cfg.PageSize)
+	if err != nil {
+		return err
+	}
+	rows := make([]*Subscription, 0, len(page.Rows))
+	for i := range page.Rows {
+		rows = append(rows, &page.Rows[i])
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, subscriptionsList(Page[*Subscription]{Rows: rows, Total: page.Total}))
+	}
+	names, err := m.svc.PlanNames(ctx.Ctx(), who)
+	if err != nil {
+		return err
+	}
+	sc, err := m.screen(ctx, who, "screen.admin_subscriptions_title", true)
+	if err != nil {
+		return err
+	}
+	return ctx.View(ViewAdminSubscriptions, AdminSubscriptionsPageData{
+		Screen: sc, Rows: subscriptionRows(sc, rows, names), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().AdminSubscriptions()),
+	})
+}
+
+// adminCancel cancels one account's subscription at once.
+func (m *Module) adminCancel(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	sub, err := m.svc.CancelNow(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewSubscriptionResource(*sub))
+	}
+	return ctx.Redirect(m.URLs().AdminSubscriptions())
+}
+
+// adminInvoices are every account's invoices.
+func (m *Module) adminInvoices(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	q := m.pageQuery(ctx)
+	page, err := m.svc.AllInvoicesPage(ctx.Ctx(), who, q, m.cfg.PageSize)
+	if err != nil {
+		return err
+	}
+	rows := make([]*Invoice, 0, len(page.Rows))
+	for i := range page.Rows {
+		rows = append(rows, &page.Rows[i])
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, invoicesList(rows, page.Total))
+	}
+	sc, err := m.screen(ctx, who, "screen.admin_invoices_title", true)
+	if err != nil {
+		return err
+	}
+	return ctx.View(ViewAdminInvoices, AdminInvoicesPageData{
+		Screen: sc, Rows: invoiceRows(sc, rows, true), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().AdminInvoices()),
+	})
+}
+
+// adminConfirm records one invoice paid by hand.
+func (m *Module) adminConfirm(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	paidAt, err := m.dayStart(ctx.Input("paid_on"), 0)
+	if err != nil {
+		return validation.Errors{"paid_on": {message("date")}}
+	}
+	in := ManualPayment{Method: ctx.Input("method"), Reference: ctx.Input("reference")}
+	if paidAt != nil {
+		in.PaidAt = paidAt.Add(12 * time.Hour)
+	}
+	inv, err := m.svc.ConfirmManually(ctx.Ctx(), who, ctx.Param("id"), in)
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewInvoiceResource(*inv))
+	}
+	return ctx.Redirect(m.URLs().AdminInvoices())
+}
+
+// adminVoid cancels one open invoice.
+func (m *Module) adminVoid(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	inv, err := m.svc.VoidInvoice(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	if ctx.WantsJSON() {
+		return ctx.JSON(stdhttp.StatusOK, NewInvoiceResource(*inv))
+	}
+	return ctx.Redirect(m.URLs().AdminInvoices())
+}
+
+// fieldsResource is a set of fields as a JSON answer.
+type fieldsResource map[string]any
+
+// ToArray is the fields.
+func (f fieldsResource) ToArray() map[string]any { return f }
+
+// With is nothing beside them.
+func (fieldsResource) With() map[string]any { return nil }
+
+func subscriptionsList(page Page[*Subscription]) list {
+	items := make([]map[string]any, 0, len(page.Rows))
+	for _, s := range page.Rows {
+		items = append(items, NewSubscriptionResource(*s).ToArray())
+	}
+	return list{items: items, total: page.Total}
+}
+
+func invoicesList(rows []*Invoice, total int) list {
+	items := make([]map[string]any, 0, len(rows))
+	for _, i := range rows {
+		items = append(items, NewInvoiceResource(*i).ToArray())
+	}
+	return list{items: items, total: total}
+}
+
+func atoi(raw string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(raw))
+	return n
+}
+
+func checked(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
+// parseMeta reads "name=value" lines.
+func parseMeta(raw string) (Meta, error) {
+	out := Meta{}
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name, value, ok := strings.Cut(line, "=")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" || len(name) > maxShortLen || len(value) > maxNameLen {
+			return nil, fmt.Errorf("billing: %q is not a name=value line", line)
+		}
+		out[name] = strings.TrimSpace(value)
+	}
+	return out, nil
+}
+
+// Migrations declares the schema this module owns, in the order the names
+// sort in, which is the order they apply in.
+func (m *Module) Migrations() []foundation.Migration {
+	return []foundation.Migration{
+		createPlans{}, createCoupons{}, createSubscriptions{},
+		createInvoices{}, createPayments{}, createCouponUsages{},
+	}
+}
+
+var (
+	_ migrations.ReversibleMigration = createPlans{}
+	_ migrations.ReversibleMigration = createCoupons{}
+	_ migrations.ReversibleMigration = createSubscriptions{}
+	_ migrations.ReversibleMigration = createInvoices{}
+	_ migrations.ReversibleMigration = createPayments{}
+	_ migrations.ReversibleMigration = createCouponUsages{}
+)
+
+// createPlans is the catalogue's table.
+type createPlans struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (createPlans) GetName() string { return "20261023_0001_create_billing_plans" }
+
+// Up creates the table: one plan per slug.
+func (createPlans) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Create(ctx, plansTable, func(table *schema.Blueprint) {
+		table.String("id", maxIdentifierLen).Primary()
+		table.String("slug", maxSlugLen)
+		table.String("name", maxNameLen)
+		table.Text("description")
+		table.Text("features")
+		table.BigInteger("price")
+		table.UnsignedSmallInteger("interval_months")
+		table.UnsignedSmallInteger("trial_days").Default(0)
+		table.UnsignedSmallInteger("grace_days").Default(0)
+		table.UnsignedSmallInteger("installments_from").Default(0)
+		table.UnsignedSmallInteger("installments_cap").Default(0)
+		table.Text("meta")
+		table.UnsignedSmallInteger("active").Default(1)
+		table.Integer("position").Default(0)
+		table.Timestamp("created_at", 6)
+		table.Timestamp("updated_at", 6)
+		table.Unique([]string{"slug"}, "billing_plans_slug_uq")
+		table.Index([]string{"active", "position", "id"}, "billing_plans_active_position_idx")
+	})
+}
+
+// Down drops the table.
+func (createPlans) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().DropIfExists(ctx, plansTable)
+}
+
+// createCoupons is the coupons' table.
+type createCoupons struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (createCoupons) GetName() string { return "20261023_0002_create_billing_coupons" }
+
+// Up creates the table: one coupon per code.
+func (createCoupons) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Create(ctx, couponsTable, func(table *schema.Blueprint) {
+		table.String("id", maxIdentifierLen).Primary()
+		table.String("code", maxCodeLen)
+		table.Text("description")
+		table.String("kind", maxShortLen)
+		table.BigInteger("value")
+		table.Integer("max_uses").Default(0)
+		table.Integer("uses").Default(0)
+		table.Timestamp("valid_from", 6).Nullable()
+		table.Timestamp("valid_until", 6).Nullable()
+		table.UnsignedSmallInteger("renewals").Default(0)
+		table.BigInteger("min_purchase").Default(0)
+		table.String("plan_id", maxIdentifierLen).Default("")
+		table.UnsignedSmallInteger("active").Default(1)
+		table.Timestamp("created_at", 6)
+		table.Timestamp("updated_at", 6)
+		table.Unique([]string{"code"}, "billing_coupons_code_uq")
+		table.Index([]string{"created_at", "id"}, "billing_coupons_created_idx")
+	})
+}
+
+// Down drops the table.
+func (createCoupons) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().DropIfExists(ctx, couponsTable)
+}
+
+// createSubscriptions is the accounts' subscriptions.
+type createSubscriptions struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (createSubscriptions) GetName() string { return "20261023_0003_create_billing_subscriptions" }
+
+// Up creates the table and the indexes the account's list, the checkout's
+// lookup and the clock's sweep read by.
+func (createSubscriptions) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Create(ctx, subscriptionsTable, func(table *schema.Blueprint) {
+		table.String("id", maxIdentifierLen).Primary()
+		table.String("tenant_id", maxIdentifierLen)
+		table.String("reference", maxIdentifierLen).Default("")
+		table.String("plan_id", maxIdentifierLen)
+		table.String("status", maxShortLen)
+		table.Timestamp("current_period_start", 6)
+		table.Timestamp("current_period_end", 6)
+		table.Timestamp("trial_ends_at", 6).Nullable()
+		table.UnsignedSmallInteger("cancel_at_period_end").Default(0)
+		table.Timestamp("canceled_at", 6).Nullable()
+		table.Timestamp("ended_at", 6).Nullable()
+		table.UnsignedSmallInteger("grace_days").Default(0)
+		table.String("coupon_id", maxIdentifierLen).Default("")
+		table.UnsignedSmallInteger("coupon_renewals_left").Default(0)
+		table.Integer("renewals").Default(0)
+		table.Text("meta")
+		table.String("created_by", maxIdentifierLen).Default("")
+		table.Timestamp("created_at", 6)
+		table.Timestamp("updated_at", 6)
+		table.Index([]string{"tenant_id", "plan_id", "reference", "status"}, "billing_subscriptions_lookup_idx")
+		table.Index([]string{"tenant_id", "current_period_end", "id"}, "billing_subscriptions_tenant_end_idx")
+		table.Index([]string{"status", "current_period_end", "id"}, "billing_subscriptions_sweep_idx")
+		table.Index([]string{"tenant_id", "created_at", "id"}, "billing_subscriptions_tenant_created_idx")
+	})
+}
+
+// Down drops the table.
+func (createSubscriptions) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().DropIfExists(ctx, subscriptionsTable)
+}
+
+// createInvoices is the accounts' invoices.
+type createInvoices struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (createInvoices) GetName() string { return "20261023_0004_create_billing_invoices" }
+
+// Up creates the table and the indexes the lists and the notification's
+// lookup read by.
+func (createInvoices) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Create(ctx, invoicesTable, func(table *schema.Blueprint) {
+		table.String("id", maxIdentifierLen).Primary()
+		table.String("tenant_id", maxIdentifierLen)
+		table.String("subscription_id", maxIdentifierLen).Default("")
+		table.String("plan_id", maxIdentifierLen)
+		table.String("plan_name", maxNameLen)
+		table.String("reference", maxIdentifierLen).Default("")
+		table.String("kind", maxShortLen)
+		table.String("status", maxShortLen)
+		table.UnsignedSmallInteger("months")
+		table.BigInteger("subtotal")
+		table.BigInteger("discount").Default(0)
+		table.BigInteger("total")
+		table.String("coupon_id", maxIdentifierLen).Default("")
+		table.String("coupon_code", maxCodeLen).Default("")
+		table.Integer("renewal_number").Default(1)
+		table.UnsignedSmallInteger("max_installments").Default(1)
+		table.String("provider", maxShortLen)
+		table.String("provider_ref", maxIdentifierLen).Default("")
+		table.String("provider_status", maxShortLen).Default("")
+		table.String("checkout_url", maxURLLen).Default("")
+		table.Text("meta")
+		table.Timestamp("paid_at", 6).Nullable()
+		table.String("created_by", maxIdentifierLen).Default("")
+		table.Timestamp("created_at", 6)
+		table.Timestamp("updated_at", 6)
+		table.Index([]string{"tenant_id", "created_at", "id"}, "billing_invoices_tenant_created_idx")
+		table.Index([]string{"tenant_id", "status", "plan_id"}, "billing_invoices_tenant_status_idx")
+		table.Index([]string{"provider", "provider_ref"}, "billing_invoices_provider_ref_idx")
+		table.Index([]string{"status", "created_at", "id"}, "billing_invoices_status_created_idx")
+	})
+}
+
+// Down drops the table.
+func (createInvoices) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().DropIfExists(ctx, invoicesTable)
+}
+
+// createPayments is the confirmations, one per invoice.
+type createPayments struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (createPayments) GetName() string { return "20261023_0005_create_billing_payments" }
+
+// Up creates the table. The unique invoice_id is the database's half of
+// confirming an invoice once.
+func (createPayments) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Create(ctx, paymentsTable, func(table *schema.Blueprint) {
+		table.String("id", maxIdentifierLen).Primary()
+		table.String("tenant_id", maxIdentifierLen)
+		table.String("invoice_id", maxIdentifierLen)
+		table.String("provider", maxShortLen)
+		table.String("provider_ref", maxIdentifierLen).Default("")
+		table.String("method", maxShortLen).Default("")
+		table.UnsignedSmallInteger("installments").Default(1)
+		table.BigInteger("amount")
+		table.Timestamp("paid_at", 6)
+		table.String("confirmed_by", maxIdentifierLen).Default("")
+		table.Timestamp("created_at", 6)
+		table.Timestamp("updated_at", 6)
+		table.Unique([]string{"invoice_id"}, "billing_payments_invoice_uq")
+		table.Index([]string{"tenant_id", "paid_at", "id"}, "billing_payments_tenant_paid_idx")
+	})
+}
+
+// Down drops the table.
+func (createPayments) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().DropIfExists(ctx, paymentsTable)
+}
+
+// createCouponUsages is the payments that used a coupon.
+type createCouponUsages struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (createCouponUsages) GetName() string { return "20261023_0006_create_billing_coupon_usages" }
+
+// Up creates the table: one use per coupon and invoice.
+func (createCouponUsages) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Create(ctx, couponUsagesTable, func(table *schema.Blueprint) {
+		table.String("id", maxIdentifierLen).Primary()
+		table.String("tenant_id", maxIdentifierLen)
+		table.String("coupon_id", maxIdentifierLen)
+		table.String("invoice_id", maxIdentifierLen)
+		table.String("payment_id", maxIdentifierLen)
+		table.BigInteger("discount")
+		table.Integer("renewal_number").Default(1)
+		table.Timestamp("used_at", 6)
+		table.Timestamp("created_at", 6)
+		table.Timestamp("updated_at", 6)
+		table.Unique([]string{"coupon_id", "invoice_id"}, "billing_coupon_usages_uq")
+		table.Index([]string{"tenant_id", "used_at", "id"}, "billing_coupon_usages_tenant_idx")
+	})
+}
+
+// Down drops the table.
+func (createCouponUsages) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().DropIfExists(ctx, couponUsagesTable)
 }
