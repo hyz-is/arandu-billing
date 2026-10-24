@@ -1,6 +1,6 @@
 //go:build kyse
 
-package skeleton
+package billing
 
 @go
 // IndexData is what a handler hands this page.
