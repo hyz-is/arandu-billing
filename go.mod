@@ -1,10 +1,10 @@
 module github.com/arandu-io/package-skeleton
 
-go 1.26.0
+go 1.26.10
 
 require (
-	github.com/arandu-io/framework v0.64.0
-	github.com/arandu-io/hesape v0.84.1
+	github.com/arandu-io/framework v0.67.0
+	github.com/arandu-io/hesape v0.88.0
 )
 
 require (
