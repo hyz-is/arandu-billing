@@ -1,16 +1,16 @@
 module github.com/hyz-is/arandu-billing
 
-go 1.26.0
+go 1.26.10
 
 require (
-	github.com/arandu-io/framework v0.65.0
-	github.com/arandu-io/hesape v0.84.2
+	github.com/arandu-io/framework v0.67.0
+	github.com/arandu-io/hesape v0.89.2
 	github.com/arandu-io/hesape/database/connectors/pgx v0.11.0
 	github.com/arandu-io/hesape/database/connectors/sqlite v0.11.0
-	github.com/arandu-io/kyse v0.43.1
-	github.com/hyz-is/arandu-activitylog v0.6.0
-	github.com/hyz-is/arandu-br v0.4.1
-	github.com/hyz-is/arandu-wallet v0.19.0
+	github.com/arandu-io/kyse v0.46.0
+	github.com/hyz-is/arandu-activitylog v0.7.0
+	github.com/hyz-is/arandu-br v0.7.0
+	github.com/hyz-is/arandu-wallet v0.20.0
 )
 
 require (
