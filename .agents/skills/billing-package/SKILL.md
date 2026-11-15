@@ -28,14 +28,27 @@ go get github.com/hyz-is/arandu-billing@v0.1.0
 		Providers: []billing.Provider{gateway, billing.ManualProvider{Instructions: cfg.PixInstructions}},
 		PublicURL: cfg.App.URL, Locale: "pt-BR", Activity: activityModule.Logger(),
 		Middleware: []func(http.Handler) http.Handler{permissionModule.Roles()},
-	}, db, sessions)
+	}, drivers.DB, drivers.Sessions)
 	if err != nil {
-		return App{}, err
+		_ = drivers.Close()
+		return nil, err
 	}
 ```
 
-and `billingModule,` inside the `k.Register(...)` call already there. `New`
-refuses a configuration with no provider, two providers of one name, a nil
+This is `App`, once `NewAppServiceProvider` has returned: `New` refuses a wiring
+that cannot work and `Configure` has no way to return that error, so the module
+is built where the error can leave. The database and the session store are the
+ones the framework built from the configuration. The module is then listed in
+the `WithProviders(...)` chain the builder is made of:
+
+```go
+	return Configure(cfg, drivers, app).
+		WithProviders(billingModule).
+		WithVersion(version, commit).
+		Create()
+```
+
+`New` refuses a configuration with no provider, two providers of one name, a nil
 database or a nil session store, so a wiring mistake costs one restart.
 
 Then, once:
@@ -47,7 +60,8 @@ aru view:build
 ```
 
 and import `storage/framework/views/modules/billing` and
-`.../modules/billing/admin`. Without them `Boot` refuses and names them.
+`.../modules/billing/admin` with the other blank imports of `bootstrap/app.go`.
+Without them `Boot` refuses and names them.
 
 ## The Provider is the application's
 

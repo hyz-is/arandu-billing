@@ -26,9 +26,9 @@ go get github.com/hyz-is/arandu-billing@v0.1.0
 ## Wire it
 
 An Arandu application registers a module explicitly, in `bootstrap/app.go`.
-These are the lines, and there are no others.
+These are the lines, and the views add one step and its imports below.
 
-The imports:
+The imports, with the other module imports:
 
 ```go
 import (
@@ -38,13 +38,17 @@ import (
 )
 ```
 
-The construction, in `Build`, after the session store, the activity log and
-the gateway service exist and before `k.Register`:
+The construction, in `App`, once `NewAppServiceProvider` has returned and the
+activity log and the gateway service exist. `New` refuses a wiring that cannot
+work and `Configure` has no way to return that error, so the module is built
+where the error can leave; the database and the session store are the ones the
+framework built from the configuration:
 
 ```go
 	gateway, err := payments.NewCheckout(cfg.Payments) // the application's own Provider
 	if err != nil {
-		return App{}, err
+		_ = drivers.Close()
+		return nil, err
 	}
 	billingModule, err := billing.New(billing.Config{
 		Prefix:      "/painel",
@@ -57,16 +61,20 @@ the gateway service exist and before `k.Register`:
 		Listener:    onBilling, // optional: the application's reaction to each event
 		Customer:    customerOf, // optional: who pays, for the gateway's page
 		Middleware:  []func(http.Handler) http.Handler{permissionModule.Roles()},
-	}, db, sessions)
+	}, drivers.DB, drivers.Sessions)
 	if err != nil {
-		return App{}, err
+		_ = drivers.Close()
+		return nil, err
 	}
 ```
 
-And the registration, inside the `k.Register(...)` call already there:
+And the registration, in the `WithProviders(...)` chain the builder is made of:
 
 ```go
-		billingModule,
+	return Configure(cfg, drivers, app).
+		WithProviders(billingModule).
+		WithVersion(version, commit).
+		Create()
 ```
 
 Then, once, before the application serves:
