@@ -3,12 +3,14 @@ package billing
 import (
 	"html/template"
 	"log/slog"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	fview "github.com/arandu-io/framework/view"
+	"github.com/arandu-io/hesape/pagination"
 	hview "github.com/arandu-io/hesape/view"
 	"github.com/arandu-io/kyse/components"
 	br "github.com/hyz-is/arandu-br"
@@ -99,25 +101,81 @@ func framePage(p hview.Page) fview.Page {
 	}
 }
 
-// TableState is what a data table on these screens was asked and answers.
+// TableState is what a data table on these screens was asked and answers: the
+// search, the status chosen, the order, the page with the size and the total of
+// the list, and the columns the reader switched off.
 type TableState struct {
 	Query, Status, Sort, Dir string
 	Page, Pages, Total       int
-	URL                      string
+	// Rows is how many rows the page holds and PerPage how many it may hold.
+	Rows, PerPage int
+	// Hidden are the keys of the columns the reader switched off.
+	Hidden []string
+	URL    string
 }
 
-func tableState(q PageQuery, page, pages, total int, base string) TableState {
-	return TableState{Query: q.Search, Status: q.Status, Sort: q.Sort, Dir: q.Dir, Page: page, Pages: pages, Total: total, URL: base}
+func tableState[T any](q PageQuery, page Page[T], hidden []string, base string) TableState {
+	return TableState{
+		Query: q.Search, Status: q.Status, Sort: q.Sort, Dir: q.Dir,
+		Page: page.Page, Pages: page.Pages, Total: page.Total, Rows: len(page.Rows), PerPage: page.PerPage,
+		Hidden: hidden, URL: base,
+	}
+}
+
+// State is the table's state as the data table draws its addresses from: every
+// control builds its address from it, so a step keeps the search, the status,
+// the order and the columns switched off.
+func (t TableState) State() components.DataTableState {
+	facets := map[string][]string{}
+	if t.Status != "" {
+		facets["status"] = []string{t.Status}
+	}
+	return components.DataTableValues{
+		Q: t.Query, Sort: t.Sort, Dir: t.Dir, Facets: facets,
+		CurrentPage: t.Page, Size: t.PerPage, DefaultSize: t.PerPage, Hide: t.Hidden,
+	}
+}
+
+// Pager is the page of the list the data table reads its position and its total
+// from.
+func (t TableState) Pager() components.Paginator {
+	return pagination.NewLengthAwarePage(t.Rows, t.Total, max(t.PerPage, 1), max(t.Page, 1), pagination.Options{Path: t.URL})
+}
+
+// maxHiddenColumns bounds how many columns a request may switch off, so the
+// address a table writes back stays short.
+const maxHiddenColumns = 16
+
+// hiddenColumns are the keys of the columns a query switched off. The table
+// only hides a column that declared itself hideable, so a key it does not know
+// changes nothing; this keeps the list short and each key a short word.
+func hiddenColumns(query url.Values) []string {
+	var keys []string
+	for _, key := range query["hide"] {
+		key = strings.TrimSpace(key)
+		if key == "" || len(key) > 32 || len(keys) == maxHiddenColumns {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 // TableLines are the sentences a data table on these screens says.
 func (s Screen) TableLines() components.DataTableLines {
 	l := s.Labels
 	return components.DataTableLines{
-		Showing: l.T("table.showing"), PerPage: l.T("table.per_page"), NoResult: l.T("table.no_result"),
-		Previous: l.T("table.previous"), Next: l.T("table.next"), Page: l.T("table.page"), PageOf: l.T("table.page_of"),
-		Back: l.T("table.back"), Forward: l.T("table.forward"), SelectAll: l.T("table.select_all"), Bulk: l.T("table.bulk"),
-		Apply: l.T("table.apply"), Ascending: l.T("table.ascending"), Descending: l.T("table.descending"), Unsorted: l.T("table.unsorted"),
+		Filter: l.T("table.filter"), NoResult: l.T("table.no_result"),
+		Rows: l.T("table.rows"), RowsOne: l.T("table.rows_one"), RowsMany: l.T("table.rows_many"),
+		SelectedCount: l.T("table.selected_count"), RowsPerPage: l.T("table.rows_per_page"), PageOf: l.T("table.page_of"),
+		First: l.T("table.first"), Previous: l.T("table.previous"), Next: l.T("table.next"), Last: l.T("table.last"),
+		Back: l.T("table.back"), Forward: l.T("table.forward"),
+		SelectAll: l.T("table.select_all"), SelectRow: l.T("table.select_row"), Bulk: l.T("table.bulk"), Apply: l.T("table.apply"),
+		Ascending: l.T("table.ascending"), Descending: l.T("table.descending"), Unsorted: l.T("table.unsorted"),
+		Reset: l.T("table.reset"), ClearFilters: l.T("table.clear_filters"),
+		NoFacetResults: l.T("table.no_facet_results"), FacetSelected: l.T("table.facet_selected"),
+		OpenMenu: l.T("table.open_menu"), Actions: l.T("table.actions"), ToggleColumns: l.T("table.toggle_columns"),
+		Asc: l.T("table.asc"), Desc: l.T("table.desc"), Hide: l.T("table.hide"),
 	}
 }
 
@@ -126,13 +184,10 @@ func (s Screen) SearchLabel(table string) string {
 	return s.Labels.line("control.search_label", map[string]any{"label": table})
 }
 
-// StatusFilter is the status filter of a data table, with the option chosen.
-func (s Screen) StatusFilter(options []components.SelectOption, chosen string) []components.DataTableFilter {
-	var selected []string
-	if chosen != "" {
-		selected = []string{chosen}
-	}
-	return []components.DataTableFilter{{Key: "status", Label: s.Labels.T("field.status"), Options: options, Selected: selected}}
+// StatusFilter is the status filter of a data table. The option chosen is the
+// table state's, not the filter's.
+func (s Screen) StatusFilter(options []components.SelectOption) []components.DataTableFilter {
+	return []components.DataTableFilter{{Key: "status", Label: s.Labels.T("field.status"), Options: options}}
 }
 
 // SubscriptionStatusOptions are where a subscription can stand.

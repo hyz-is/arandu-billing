@@ -146,7 +146,7 @@ func main() {
 	})
 	urls := billing.NewURLs("/painel", "/admin/cobranca", "", billing.PortuguesePaths)
 	sc := billing.Screen{Labels: billing.Labels{Locale: "pt-BR"}, URLs: urls}
-	table := billing.TableState{Page: 1, Pages: 3, Total: 61, Status: "active", URL: "/painel/assinaturas"}
+	table := billing.TableState{Page: 1, Pages: 3, Total: 61, Rows: 1, PerPage: 25, Status: "active", URL: "/painel/assinaturas"}
 	subscription := billing.SubscriptionRow{ID: "s1", Tenant: "acme", Plan: "Câmera mensal", Reference: "camera:42", Status: "Ativa",
 		StatusKey: "active", PaidUntil: "23/11/2026", Started: "23/10/2026", Serving: true, Cancelling: true,
 		RenewURL: urls.Renew("s1"), CancelURL: urls.Cancel("s1"), AdminCancelURL: urls.AdminCancel("s1")}

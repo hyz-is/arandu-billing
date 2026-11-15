@@ -57,11 +57,10 @@ func subscriptionsTable(data SubscriptionsData) components.DataTableProps {
 	return components.DataTableProps{
 		ID: "billing-subscriptions", Label: data.Labels.T("screen.subscriptions_title"), URL: data.Table.URL,
 		ColumnsLabel: data.Labels.T("control.columns"), Lines: data.TableLines(),
-		Query: data.Table.Query, SearchName: "q", SearchPlaceholder: data.Labels.T("control.search_placeholder"),
+		State: data.Table.State(), Paginator: data.Table.Pager(), FullPager: true, HeaderMenu: true,
+		Searchable: true, SearchPlaceholder: data.Labels.T("control.search_placeholder"),
 		SearchLabel: data.SearchLabel(data.Labels.T("screen.subscriptions_title")),
-		Filters: data.StatusFilter(data.SubscriptionStatusOptions(), data.Table.Status),
-		SortKey: data.Table.Sort, SortDir: data.Table.Dir,
-		Page: data.Table.Page, Pages: data.Table.Pages, Total: data.Table.Total,
+		Filters: data.StatusFilter(data.SubscriptionStatusOptions()),
 		Columns: []components.TableColumn{
 			{Label: data.Labels.T("field.plan"), Key: "plan"},
 			{Label: data.Labels.T("field.reference"), Key: "reference", Hideable: true},

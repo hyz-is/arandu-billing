@@ -42,11 +42,10 @@ func invoicesTable(data InvoicesData) components.DataTableProps {
 	return components.DataTableProps{
 		ID: "billing-admin-invoices", Label: data.Labels.T("screen.admin_invoices_title"), URL: data.Table.URL,
 		ColumnsLabel: data.Labels.T("control.columns"), Lines: data.TableLines(),
-		Query: data.Table.Query, SearchName: "q", SearchPlaceholder: data.Labels.T("control.search_placeholder"),
+		State: data.Table.State(), Paginator: data.Table.Pager(), FullPager: true, HeaderMenu: true,
+		Searchable: true, SearchPlaceholder: data.Labels.T("control.search_placeholder"),
 		SearchLabel: data.SearchLabel(data.Labels.T("screen.admin_invoices_title")),
-		Filters: data.StatusFilter(data.InvoiceStatusOptions(), data.Table.Status),
-		SortKey: data.Table.Sort, SortDir: data.Table.Dir,
-		Page: data.Table.Page, Pages: data.Table.Pages, Total: data.Table.Total,
+		Filters: data.StatusFilter(data.InvoiceStatusOptions()),
 		Columns: []components.TableColumn{
 			{Label: data.Labels.T("field.created_at"), Key: "created_at", Sortable: true},
 			{Label: data.Labels.T("field.tenant"), Key: "tenant", Sortable: true},
@@ -55,7 +54,7 @@ func invoicesTable(data InvoicesData) components.DataTableProps {
 			{Label: data.Labels.T("field.total"), Key: "total", Sortable: true, Align: "right"},
 			{Label: data.Labels.T("field.status"), Key: "status", Sortable: true},
 			{Label: data.Labels.T("field.provider"), Key: "provider", Hideable: true},
-			{Label: data.Labels.T("field.provider_status"), Key: "provider_status", Hideable: true, Hidden: true},
+			{Label: data.Labels.T("field.provider_status"), Key: "provider_status", Hideable: true},
 			{Label: data.Labels.T("field.paid_at"), Key: "paid_at", Sortable: true, Hideable: true},
 			{Label: "", Key: "actions"},
 		},

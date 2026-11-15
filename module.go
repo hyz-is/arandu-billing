@@ -354,7 +354,7 @@ func (m *Module) subscriptions(ctx *fhttp.Context) error {
 		return err
 	}
 	return ctx.View(ViewSubscriptions, SubscriptionsPageData{
-		Screen: sc, Rows: subscriptionRows(sc, page.Rows, names), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().Subscriptions()),
+		Screen: sc, Rows: subscriptionRows(sc, page.Rows, names), Table: tableState(q, page, hiddenColumns(ctx.Request.URL.Query()), m.URLs().Subscriptions()),
 		CanManage: IsAccountManager(who),
 	})
 }
@@ -411,7 +411,7 @@ func (m *Module) invoices(ctx *fhttp.Context) error {
 		return err
 	}
 	return ctx.View(ViewInvoices, InvoicesPageData{
-		Screen: sc, Rows: invoiceRows(sc, page.Rows, false), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().Invoices()),
+		Screen: sc, Rows: invoiceRows(sc, page.Rows, false), Table: tableState(q, page, hiddenColumns(ctx.Request.URL.Query()), m.URLs().Invoices()),
 	})
 }
 
@@ -467,7 +467,7 @@ func (m *Module) adminPlans(ctx *fhttp.Context) error {
 		return err
 	}
 	return ctx.View(ViewAdminPlans, AdminPlansPageData{
-		Screen: sc, Rows: planRows(sc, page.Rows), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().AdminPlans()),
+		Screen: sc, Rows: planRows(sc, page.Rows), Table: tableState(q, page, hiddenColumns(ctx.Request.URL.Query()), m.URLs().AdminPlans()),
 		StoreURL: m.URLs().AdminPlans(), NewPlan: PlanForm{Active: true, IntervalMonths: "1", InstallmentsCap: strconv.Itoa(MaxInstallments)},
 	})
 }
@@ -571,7 +571,7 @@ func (m *Module) adminCoupons(ctx *fhttp.Context) error {
 		return err
 	}
 	return ctx.View(ViewAdminCoupons, AdminCouponsPageData{
-		Screen: sc, Rows: couponRows(sc, page.Rows, names), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().AdminCoupons()),
+		Screen: sc, Rows: couponRows(sc, page.Rows, names), Table: tableState(q, page, hiddenColumns(ctx.Request.URL.Query()), m.URLs().AdminCoupons()),
 		StoreURL: m.URLs().AdminCoupons(), PlanOptions: planOptions(sc, names),
 	})
 }
@@ -675,7 +675,7 @@ func (m *Module) adminSubscriptions(ctx *fhttp.Context) error {
 		return err
 	}
 	return ctx.View(ViewAdminSubscriptions, AdminSubscriptionsPageData{
-		Screen: sc, Rows: subscriptionRows(sc, rows, names), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().AdminSubscriptions()),
+		Screen: sc, Rows: subscriptionRows(sc, rows, names), Table: tableState(q, page, hiddenColumns(ctx.Request.URL.Query()), m.URLs().AdminSubscriptions()),
 	})
 }
 
@@ -712,7 +712,7 @@ func (m *Module) adminInvoices(ctx *fhttp.Context) error {
 		return err
 	}
 	return ctx.View(ViewAdminInvoices, AdminInvoicesPageData{
-		Screen: sc, Rows: invoiceRows(sc, rows, true), Table: tableState(q, page.Page, page.Pages, page.Total, m.URLs().AdminInvoices()),
+		Screen: sc, Rows: invoiceRows(sc, rows, true), Table: tableState(q, page, hiddenColumns(ctx.Request.URL.Query()), m.URLs().AdminInvoices()),
 	})
 }
 

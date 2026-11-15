@@ -10,6 +10,17 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+### Changed
+
+- The six lists are drawn with Kyse's server-side data table: the views hand it
+  a `State` (`TableState.State`) and a `Paginator` (`TableState.Pager`) instead of
+  a query, a sort and the page numbers, and the columns a reader switched off
+  survive a search, an order and a page through the `hide` parameter. A column
+  that started hidden starts shown. `Screen.StatusFilter` no longer takes the
+  status chosen. Requires Kyse v0.53.0.
+- The `table` block of the catalogue names the sentences of the new table, in
+  `en` and `pt-BR`; `table.showing`, `table.per_page` and `table.page` are gone.
+
 ## [0.1.0] - 2026-10-23
 
 ### Added
