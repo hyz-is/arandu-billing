@@ -91,6 +91,7 @@ func planFields(labels billing.Labels, form billing.PlanForm, page billing.FormS
 		</div>
 		{!! components.Textarea(components.TextareaProps{Name: "description", Label: .Labels.T("field.description"), Value: .NewPlan.Description, Rows: 2, Page: .Form()}) !!}
 		{!! components.Textarea(components.TextareaProps{Name: "features", Label: .Labels.T("field.features"), Value: .NewPlan.Features, Hint: .Labels.T("screen.features_hint"), Rows: 4, Page: .Form()}) !!}
+		{!! components.Textarea(components.TextareaProps{Name: "cycles", Label: .Labels.T("field.cycles"), Value: .NewPlan.Cycles, Hint: .Labels.T("screen.cycles_hint"), Rows: 3, Page: .Form()}) !!}
 		{!! components.Textarea(components.TextareaProps{Name: "meta", Label: .Labels.T("field.meta"), Value: .NewPlan.Meta, Hint: .Labels.T("screen.meta_hint"), Rows: 3, Page: .Form()}) !!}
 		{!! components.Checkbox(components.CheckboxProps{Name: "active", Label: .Labels.T("field.active"), Value: "1", Checked: .NewPlan.Active, Page: .Form()}) !!}
 		<div>{!! components.Button(components.ButtonProps{Label: .Labels.T("control.save"), Type: "submit"}) !!}</div>

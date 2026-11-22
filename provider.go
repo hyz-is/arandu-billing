@@ -59,11 +59,14 @@ type CheckoutRequest struct {
 	Description string
 	// PlanID and PlanSlug are the plan charged for.
 	PlanID, PlanSlug string
-	// Months is how many months the payment buys.
+	// Months is how many months the payment buys: the billing cycle the
+	// subscriber chose.
 	Months int
-	// Subtotal, Discount and Total are in centavos of BRL; Total is what is
-	// charged.
-	Subtotal, Discount, Total int64
+	// Subtotal, CycleDiscount, Discount and Total are in centavos of BRL.
+	// Subtotal is the plan's price for Months before any discount,
+	// CycleDiscount is what the billing cycle takes off it, Discount is what
+	// the coupon takes off the rest, and Total is what is charged.
+	Subtotal, CycleDiscount, Discount, Total int64
 	// CouponCode is the coupon applied, empty for none.
 	CouponCode string
 	// MaxInstallments is the most installments the page may offer.

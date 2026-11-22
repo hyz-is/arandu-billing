@@ -1,6 +1,34 @@
 # Upgrade Guide
 
-## Unreleased
+## v0.3.0
+
+### Billing cycles
+
+Run `aru migrate`: the migration `20261122_0007_add_billing_cycles` adds
+`billing_plans.cycles`, `billing_subscriptions.cycle_months` and
+`billing_invoices.cycle_discount`. Nothing is removed, and every plan,
+subscription and invoice that exists keeps the plan's own interval.
+
+- A plan sells more than its `IntervalMonths` when `Plan.Cycles` declares the
+  cycles (`PlanRequest.Cycles`, or the `cycles` field of the admin's plan form,
+  `months=percent` per line). Subscribe in one with
+  `SubscribeRequest.CycleMonths`; renew in another with `RenewCycle`. `Renew`
+  keeps the subscription's cycle.
+- `Invoice.Subtotal` is now the price for the invoice's months before any
+  discount, and the new `Invoice.CycleDiscount` is what the cycle took off it:
+  `Total` is `Subtotal - CycleDiscount - Discount`. For an invoice with no
+  cycle `CycleDiscount` is zero and the three fields read as before. A gateway
+  that charges `CheckoutRequest.Total` needs no change; one that prints the
+  discount shows `CycleDiscount + Discount`.
+- Republish the views to get the `cycles` textarea and the cycle selector:
+
+```sh
+aru vendor:publish --tag=view
+aru vendor:publish --tag=view --apply
+aru view:build
+```
+
+## v0.2.1
 
 ### The lists are drawn as Kyse's data table now draws them
 

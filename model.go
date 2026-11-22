@@ -3,7 +3,9 @@ package billing
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +53,9 @@ type Plan struct {
 	// InstallmentsCap is the most installments offered, never above
 	// MaxInstallments. Zero means MaxInstallments.
 	InstallmentsCap int `db:"installments_cap"`
+	// Cycles are the billing cycles besides IntervalMonths a subscriber may
+	// choose, each with its discount. Empty offers only IntervalMonths.
+	Cycles CycleList `db:"cycles"`
 	// Meta is what the consuming application attaches to the plan: the
 	// cameras it covers, the credits it deposits. This package stores it and
 	// hands it back in every event, and decides nothing from it.
@@ -165,6 +170,10 @@ type Subscription struct {
 	CouponID string `db:"coupon_id"`
 	// CouponRenewalsLeft is how many renewals still get that discount.
 	CouponRenewalsLeft int `db:"coupon_renewals_left"`
+	// CycleMonths is the billing cycle the subscriber chose, in months, and
+	// the one every renewal is invoiced for. Zero follows the plan's own
+	// IntervalMonths.
+	CycleMonths int `db:"cycle_months"`
 	// Renewals is how many times it was renewed after the first payment.
 	Renewals int `db:"renewals"`
 	// Meta is what the consumer attached when it started the subscription.
@@ -211,13 +220,19 @@ type Invoice struct {
 	Kind InvoiceKind `db:"kind"`
 	// Status is where the invoice stands.
 	Status InvoiceStatus `db:"status"`
-	// Months is how many months the payment buys.
+	// Months is how many months the payment buys: the billing cycle chosen.
 	Months int `db:"months"`
-	// Subtotal is the plan's price, in centavos.
+	// Subtotal is the plan's price for Months at its own rate, before any
+	// discount, in centavos.
 	Subtotal int64 `db:"subtotal"`
-	// Discount is the coupon's discount, in centavos.
+	// CycleDiscount is what the billing cycle takes off Subtotal, in
+	// centavos.
+	CycleDiscount int64 `db:"cycle_discount"`
+	// Discount is the coupon's discount, in centavos, taken off the price
+	// the cycle left.
 	Discount int64 `db:"discount"`
-	// Total is what is charged, in centavos.
+	// Total is what is charged, in centavos: Subtotal minus CycleDiscount
+	// minus Discount.
 	Total int64 `db:"total"`
 	// CouponID is the coupon applied, empty for none.
 	CouponID string `db:"coupon_id"`
@@ -549,6 +564,97 @@ func jsonText(value any) (string, error) {
 	return "", fmt.Errorf("billing: a JSON column answered with a %T", value)
 }
 
+// MaxCycles is the most billing cycles one plan may declare.
+const MaxCycles = 12
+
+// MaxCycleDiscount is the largest discount a cycle may carry, in basis
+// points: a cycle is never free.
+const MaxCycleDiscount = 9999
+
+// Cycle is one billing cycle a plan sells: how many months one payment buys
+// and the discount that cycle gets over the plan's own rate.
+type Cycle struct {
+	// Months is how many months one payment of the cycle buys.
+	Months int `json:"months"`
+	// Discount is what the cycle takes off, in basis points: 1000 is 10%.
+	Discount int64 `json:"discount"`
+}
+
+// CycleList is a plan's cycles held as a JSON array.
+type CycleList []Cycle
+
+// Value writes the list as a JSON array; an empty list is "[]".
+func (l CycleList) Value() (driver.Value, error) {
+	if len(l) == 0 {
+		return "[]", nil
+	}
+	body, err := json.Marshal([]Cycle(l))
+	return string(body), err
+}
+
+// Scan reads the list back from its JSON text; a missing column is an empty
+// list.
+func (l *CycleList) Scan(value any) error {
+	text, err := jsonText(value)
+	if err != nil || text == "" {
+		*l = nil
+		return err
+	}
+	var out []Cycle
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		return fmt.Errorf("billing: a cycles column does not hold a JSON array: %w", err)
+	}
+	*l = out
+	return nil
+}
+
+// ErrCycleUnavailable says a plan does not sell the billing cycle asked for.
+var ErrCycleUnavailable = errors.New("billing: the plan does not offer that billing cycle")
+
+// Cycle is the billing cycle of months months on this plan, with its
+// discount. Zero months is the plan's own IntervalMonths. A cycle the plan
+// does not declare is ErrCycleUnavailable, except IntervalMonths itself, which
+// is always sold at the plan's rate unless a declared cycle gives it a
+// discount.
+func (p Plan) Cycle(months int) (Cycle, error) {
+	if months == 0 {
+		months = p.IntervalMonths
+	}
+	for _, c := range p.Cycles {
+		if c.Months == months {
+			return c, nil
+		}
+	}
+	if months == p.IntervalMonths {
+		return Cycle{Months: months}, nil
+	}
+	return Cycle{}, ErrCycleUnavailable
+}
+
+// OfferedCycles are the cycles a subscriber may choose, shortest first: the
+// plan's own IntervalMonths and every declared cycle.
+func (p Plan) OfferedCycles() []Cycle {
+	out := make([]Cycle, 0, len(p.Cycles)+1)
+	own, _ := p.Cycle(0)
+	out = append(out, own)
+	for _, c := range p.Cycles {
+		if c.Months != p.IntervalMonths {
+			out = append(out, c)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Months < out[j].Months })
+	return out
+}
+
+// CycleMonthsFor is the months a subscription is invoiced for: the cycle it
+// chose, or the plan's own IntervalMonths when it chose none.
+func (s Subscription) CycleMonthsFor(p Plan) int {
+	if s.CycleMonths > 0 {
+		return s.CycleMonths
+	}
+	return p.IntervalMonths
+}
+
 // Installments is how many installments the plan may be paid in: one unless
 // its period is at least InstallmentsFrom months, and then up to one per month
 // of the period, never more than InstallmentsCap or MaxInstallments.
@@ -556,11 +662,15 @@ func jsonText(value any) (string, error) {
 //	InstallmentsFrom 6, IntervalMonths 3  -> 1
 //	InstallmentsFrom 6, IntervalMonths 6  -> 6
 //	InstallmentsFrom 6, IntervalMonths 24 -> 12
-func (p Plan) Installments() int {
-	if p.InstallmentsFrom <= 0 || p.IntervalMonths < p.InstallmentsFrom {
+func (p Plan) Installments() int { return p.InstallmentsFor(p.IntervalMonths) }
+
+// InstallmentsFor is Installments for a payment of months months, the billing
+// cycle chosen.
+func (p Plan) InstallmentsFor(months int) int {
+	if p.InstallmentsFrom <= 0 || months < p.InstallmentsFrom {
 		return 1
 	}
-	most := p.IntervalMonths
+	most := months
 	limit := MaxInstallments
 	if p.InstallmentsCap > 0 && p.InstallmentsCap < limit {
 		limit = p.InstallmentsCap

@@ -21,6 +21,11 @@ type SubscribeRequest struct {
 	PlanID string
 	// CouponCode is the coupon typed, empty for none.
 	CouponCode string
+	// CycleMonths is the billing cycle the subscriber chose, in months: one of
+	// the plan's OfferedCycles. Zero is the plan's own IntervalMonths. The
+	// invoice charges the plan's price for those months with the cycle's
+	// discount, and the subscription is paid for that many months.
+	CycleMonths int
 	// Reference is what inside the account the subscription pays for, in the
 	// application's words; empty is the account itself. It is set by the
 	// application's own code, never read from a customer's form by this
@@ -40,6 +45,9 @@ func (r SubscribeRequest) Validate() validation.Errors {
 	validation.MaxLen(e, "plan_id", r.PlanID, maxIdentifierLen)
 	validation.MaxLen(e, "coupon", r.CouponCode, maxCodeLen)
 	validation.MaxLen(e, "reference", r.Reference, maxIdentifierLen)
+	if r.CycleMonths < 0 || r.CycleMonths > MaxIntervalMonths {
+		e.Add("cycle", message("between", translation.Replace{"min": "0", "max": itoa(MaxIntervalMonths)}))
+	}
 	if len(r.Meta) > 40 {
 		e.Add("meta", message("meta_count", translation.Replace{"max": "40"}))
 	}
@@ -84,9 +92,10 @@ func (s *BillingService) Subscribe(ctx context.Context, actor security.Subject, 
 	return s.issue(ctx, g, actor, plan, current, in)
 }
 
-// Renew issues the invoice of a subscription's next period. A subscription
-// that still has renewals of its coupon gets the discount again; one that
-// ended is paid for as a new period from the day it is paid.
+// Renew issues the invoice of a subscription's next period, in the billing
+// cycle the subscription already has. A subscription that still has renewals
+// of its coupon gets the discount again; one that ended is paid for as a new
+// period from the day it is paid.
 func (s *BillingService) Renew(ctx context.Context, actor security.Subject, subscriptionID, provider string) (*CheckoutResult, error) {
 	g, err := security.Authorize(ctx, s.policy, actor, Subscribe, Account{TenantID: actor.Tenant})
 	if err != nil {
@@ -103,7 +112,37 @@ func (s *BillingService) Renew(ctx context.Context, actor security.Subject, subs
 	if sub.Ended() && !bool(plan.Active) {
 		return nil, validation.Errors{"plan_id": {message("plan_inactive")}}
 	}
-	return s.issue(ctx, g, actor, plan, sub, SubscribeRequest{PlanID: plan.ID, Reference: sub.Reference, Meta: sub.Meta, Provider: provider})
+	return s.issue(ctx, g, actor, plan, sub, SubscribeRequest{PlanID: plan.ID, CycleMonths: sub.CycleMonthsFor(*plan), Reference: sub.Reference, Meta: sub.Meta, Provider: provider})
+}
+
+// RenewCycle is Renew in a billing cycle chosen now: the change takes effect
+// with this invoice and, once it is paid, every renewal after it keeps the new
+// cycle; the period already paid for is never changed. Zero months keeps the
+// subscription's own cycle, and a cycle the plan stopped offering is refused
+// until another is chosen.
+func (s *BillingService) RenewCycle(ctx context.Context, actor security.Subject, subscriptionID, provider string, cycleMonths int) (*CheckoutResult, error) {
+	if cycleMonths < 0 || cycleMonths > MaxIntervalMonths {
+		return nil, validation.Errors{"cycle": {message("between", translation.Replace{"min": "0", "max": itoa(MaxIntervalMonths)})}}
+	}
+	g, err := security.Authorize(ctx, s.policy, actor, Subscribe, Account{TenantID: actor.Tenant})
+	if err != nil {
+		return nil, err
+	}
+	sub, err := Subscriptions(s.db).WhereKey(subscriptionID).FirstOrFail(ctx, g)
+	if err != nil {
+		return nil, notFound(err)
+	}
+	plan, err := Plans(s.db).WhereKey(sub.PlanID).FirstOrFail(ctx, g)
+	if err != nil {
+		return nil, notFound(err)
+	}
+	if sub.Ended() && !bool(plan.Active) {
+		return nil, validation.Errors{"plan_id": {message("plan_inactive")}}
+	}
+	if cycleMonths == 0 {
+		cycleMonths = sub.CycleMonthsFor(*plan)
+	}
+	return s.issue(ctx, g, actor, plan, sub, SubscribeRequest{PlanID: plan.ID, CycleMonths: cycleMonths, Reference: sub.Reference, Meta: sub.Meta, Provider: provider})
 }
 
 // issue prices the period, writes the invoice, and asks the provider for its
@@ -141,7 +180,11 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 			return nil, err
 		}
 	}
-	quote, err := Price(*plan, coupon, renewal && coupon != nil, now)
+	cycle, err := plan.Cycle(in.CycleMonths)
+	if err != nil {
+		return nil, validation.Errors{"cycle": {message("cycle_unavailable")}}
+	}
+	quote, err := PriceCycle(*plan, cycle.Months, coupon, renewal && coupon != nil, now)
 	if err != nil {
 		return nil, couponRefusal(err)
 	}
@@ -158,7 +201,7 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 	// A checkout asked twice -- a double click, a back button -- answers the
 	// open invoice it already issued rather than a second one.
 	reused, err := Invoices(s.db).Where("status", "=", string(InvoiceOpen)).Where("plan_id", "=", plan.ID).
-		Where("subscription_id", "=", subID).Where("reference", "=", reference).Where("total", "=", quote.Total).
+		Where("subscription_id", "=", subID).Where("reference", "=", reference).Where("months", "=", cycle.Months).Where("total", "=", quote.Total).
 		Where("coupon_code", "=", couponCodeOf(coupon)).Where("provider", "=", providerName).
 		Where("checkout_url", "!=", "").Where("created_at", ">=", now.Add(-24*time.Hour)).
 		OrderByDesc("created_at").FirstOrFail(ctx, g)
@@ -180,8 +223,8 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 	inv.PlanID, inv.PlanName = plan.ID, plan.Name
 	inv.Reference = reference
 	inv.Kind, inv.Status = kind, InvoiceOpen
-	inv.Months = plan.IntervalMonths
-	inv.Subtotal, inv.Discount, inv.Total = quote.Subtotal, quote.Discount, quote.Total
+	inv.Months = cycle.Months
+	inv.Subtotal, inv.CycleDiscount, inv.Discount, inv.Total = quote.Subtotal, quote.CycleDiscount, quote.Discount, quote.Total
 	if coupon != nil {
 		inv.CouponID, inv.CouponCode = coupon.ID, coupon.Code
 	}
@@ -198,7 +241,8 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 		return nil, err
 	}
 	if err := s.record(ctx, g, actor, activityInvoiceCreated, "billing_invoice", inv.ID, map[string]any{
-		"plan": plan.Slug, "total": inv.Total, "discount": inv.Discount, "coupon": inv.CouponCode, "provider": providerName,
+		"plan": plan.Slug, "cycle": inv.Months, "cycle_discount": inv.CycleDiscount, "total": inv.Total, "discount": inv.Discount,
+		"coupon": inv.CouponCode, "provider": providerName,
 	}); err != nil {
 		return nil, err
 	}
@@ -227,9 +271,9 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 	}
 	checkout, err := provider.CreateCheckout(ctx, CheckoutRequest{
 		InvoiceID: inv.ID, Tenant: inv.TenantID,
-		Description: s.labelsFor(ctx).describeInvoice(plan.Name, plan.IntervalMonths),
-		PlanID:      plan.ID, PlanSlug: plan.Slug, Months: plan.IntervalMonths,
-		Subtotal: inv.Subtotal, Discount: inv.Discount, Total: inv.Total, CouponCode: inv.CouponCode,
+		Description: s.labelsFor(ctx).describeInvoice(plan.Name, inv.Months),
+		PlanID:      plan.ID, PlanSlug: plan.Slug, Months: inv.Months,
+		Subtotal: inv.Subtotal, CycleDiscount: inv.CycleDiscount, Discount: inv.Discount, Total: inv.Total, CouponCode: inv.CouponCode,
 		MaxInstallments: inv.MaxInstallments, Customer: customer, ReturnURL: returnURL, Meta: Meta(meta),
 	})
 	if err != nil {

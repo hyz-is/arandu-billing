@@ -10,6 +10,48 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-22
+
+### Added
+
+- Billing cycles. A plan may declare the cycles a subscriber can choose besides
+  its own `IntervalMonths`, each with a discount in basis points
+  (`Plan.Cycles`, a `CycleList` of `Cycle{Months, Discount}`; at most
+  `MaxCycles`, a discount of at most `MaxCycleDiscount`). The invoice charges
+  the plan's price for the cycle's months, `price x months / IntervalMonths`,
+  less the cycle's discount, each rounded half up to the centavo, and the
+  subscription is paid for that many months. A plan with no cycles behaves as it
+  always did.
+- `SubscribeRequest.CycleMonths` chooses the cycle at checkout; zero is the
+  plan's own `IntervalMonths`. A cycle the plan does not offer is refused with a
+  validation error on `cycle` (`ErrCycleUnavailable` from the pure rules) and
+  nothing is issued.
+- `BillingService.RenewCycle` renews in a cycle chosen now. A change of cycle
+  applies to the invoice being issued and, once it is paid, to every renewal
+  after it; the period already paid for is never changed. `Renew` keeps the
+  subscription's own cycle, and a cycle the plan stopped offering is refused
+  until another is chosen.
+- `Subscription.CycleMonths` (the cycle renewals are invoiced in; zero follows
+  the plan), `Invoice.CycleDiscount`, `Quote.CycleDiscount` and
+  `CheckoutRequest.CycleDiscount`. `Invoice.Subtotal` is the price for the
+  invoice's months before any discount and `Total` is `Subtotal -
+  CycleDiscount - Discount`; the coupon takes its discount off the price the
+  cycle left, and its minimum purchase is read against that price.
+- The pure rules `PriceCycle`, `CyclePrice`, `Plan.Cycle`, `Plan.OfferedCycles`,
+  `Plan.InstallmentsFor` and `Subscription.CycleMonthsFor`; `Price` is
+  `PriceCycle` at the plan's own interval.
+- The admin's plan form has a `cycles` field of `months=percent` lines
+  (`3=5`, `12=17,5`), and the account's plans screen draws a cycle selector on a
+  plan that sells more than one. `POST /planos/{id}/assinar` and `POST
+  /assinaturas/{id}/pagamento` read an optional `cycle` field.
+- The activity entries of an invoice issued and paid record the cycle
+  (`cycle`, `cycle_discount`), and the plan entries record its cycles.
+- The migration `20261122_0007_add_billing_cycles`: `cycles` on the plans,
+  `cycle_months` on the subscriptions and `cycle_discount` on the invoices,
+  every existing row keeping the plan's own interval. Run `aru migrate`.
+
+## [0.2.1] - 2026-11-15
+
 ### Changed
 
 - The six lists are drawn with Kyse's server-side data table: the views hand it

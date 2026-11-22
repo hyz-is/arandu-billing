@@ -9,14 +9,19 @@ import (
 // pure: no database, no clock read inside, no Grant. The service loads the
 // plan and the coupon, asks these functions, and saves what they answer.
 
-// Quote is what one period of a plan costs with a coupon.
+// Quote is what one period of a plan costs in a billing cycle, with a coupon.
 type Quote struct {
-	// Subtotal is the plan's price, in centavos.
+	// Subtotal is the plan's price for the cycle's months at its own rate,
+	// before any discount, in centavos.
 	Subtotal int64
-	// Discount is what the coupon takes off, in centavos; never more than
-	// Subtotal.
+	// CycleDiscount is what the billing cycle takes off Subtotal, in
+	// centavos.
+	CycleDiscount int64
+	// Discount is what the coupon takes off the price the cycle left, in
+	// centavos; never more than that price.
 	Discount int64
-	// Total is what is charged, in centavos: Subtotal minus Discount.
+	// Total is what is charged, in centavos: Subtotal minus CycleDiscount
+	// minus Discount.
 	Total int64
 	// MaxInstallments is the most installments the period may be paid in.
 	MaxInstallments int
@@ -86,19 +91,61 @@ func DiscountOf(c Coupon, price int64) int64 {
 
 // Price is what one period of the plan costs, with the coupon when one is
 // given: checked with CheckCoupon for a first payment, taken as granted for a
-// renewal the subscription still has coupon renewals for.
+// renewal the subscription still has coupon renewals for. It prices the plan's
+// own IntervalMonths; PriceCycle prices another cycle.
 func Price(p Plan, c *Coupon, renewal bool, at time.Time) (Quote, error) {
-	q := Quote{Subtotal: p.Price, Total: p.Price, MaxInstallments: p.Installments()}
+	return PriceCycle(p, p.IntervalMonths, c, renewal, at)
+}
+
+// CyclePrice is what months months of the plan cost: the plan's price at its
+// own rate, scaled to the months and rounded half up to the centavo, and what
+// the cycle's discount takes off it, rounded the same way. The months must be
+// one the plan offers (Plan.Cycle), or the answer is ErrCycleUnavailable.
+//
+//	Price 10000, IntervalMonths 1, months 3, discount 500 -> 30000, 1500
+func CyclePrice(p Plan, months int) (list, discount int64, err error) {
+	cycle, err := p.Cycle(months)
+	if err != nil {
+		return 0, 0, err
+	}
+	interval := int64(p.IntervalMonths)
+	if interval < 1 {
+		interval = 1
+	}
+	list = roundDiv(p.Price*int64(cycle.Months), interval)
+	discount = list - roundDiv(list*(10000-cycle.Discount), 10000)
+	return list, discount, nil
+}
+
+// roundDiv is a divided by b, rounded half up; both are positive.
+func roundDiv(a, b int64) int64 { return (a + b/2) / b }
+
+// PriceCycle is Price for a payment of months months: the billing cycle's
+// discount comes off first and the coupon takes its discount off what is
+// left, so the coupon's minimum purchase is read against that price. Zero
+// months is the plan's own IntervalMonths.
+func PriceCycle(p Plan, months int, c *Coupon, renewal bool, at time.Time) (Quote, error) {
+	if months == 0 {
+		months = p.IntervalMonths
+	}
+	list, off, err := CyclePrice(p, months)
+	if err != nil {
+		return Quote{}, err
+	}
+	price := list - off
+	q := Quote{Subtotal: list, CycleDiscount: off, Total: price, MaxInstallments: p.InstallmentsFor(months)}
 	if c == nil {
 		return q, nil
 	}
 	if !renewal {
-		if err := CheckCoupon(*c, p, at); err != nil {
+		priced := p
+		priced.Price = price
+		if err := CheckCoupon(*c, priced, at); err != nil {
 			return Quote{}, err
 		}
 	}
-	q.Discount = DiscountOf(*c, p.Price)
-	q.Total = p.Price - q.Discount
+	q.Discount = DiscountOf(*c, price)
+	q.Total = price - q.Discount
 	q.CouponApplied = true
 	return q, nil
 }

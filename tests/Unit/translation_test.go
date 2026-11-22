@@ -35,6 +35,7 @@ var sameInBothLanguages = map[string]bool{
 	"billing.field.subtotal":       true,
 	"billing.field.total":          true,
 	"billing.screen.invoice_line":  true, // :plan — :months
+	"billing.screen.cycle_option":  true, // :period — :price
 	"billing.control.search_label": false,
 }
 

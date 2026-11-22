@@ -297,10 +297,11 @@ func (m *Module) plans(ctx *fhttp.Context) error {
 	return ctx.View(ViewPlans, PlansPageData{Screen: sc, Plans: planCards(sc, rows), CanSubscribe: IsAccountManager(who)})
 }
 
-// checkout pays for one plan, with the coupon typed.
+// checkout pays for one plan, with the coupon typed and the billing cycle
+// chosen: the plan's own interval when none is.
 func (m *Module) checkout(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
-	result, err := m.svc.Subscribe(ctx.Ctx(), who, SubscribeRequest{PlanID: ctx.Param("id"), CouponCode: ctx.Input("coupon")})
+	result, err := m.svc.Subscribe(ctx.Ctx(), who, SubscribeRequest{PlanID: ctx.Param("id"), CouponCode: ctx.Input("coupon"), CycleMonths: atoi(ctx.Input("cycle"))})
 	if err != nil {
 		return err
 	}
@@ -359,10 +360,11 @@ func (m *Module) subscriptions(ctx *fhttp.Context) error {
 	})
 }
 
-// renew pays the next period of one subscription.
+// renew pays the next period of one subscription, in the billing cycle
+// chosen now or, when none is, the one it already has.
 func (m *Module) renew(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
-	result, err := m.svc.Renew(ctx.Ctx(), who, ctx.Param("id"), "")
+	result, err := m.svc.RenewCycle(ctx.Ctx(), who, ctx.Param("id"), "", atoi(ctx.Input("cycle")))
 	if err != nil {
 		return err
 	}
@@ -486,12 +488,16 @@ func planRequest(ctx *fhttp.Context) (PlanRequest, error) {
 	if err != nil {
 		return PlanRequest{}, validation.Errors{"meta": {message("meta_lines")}}
 	}
+	cycles, err := parseCycles(ctx.Input("cycles"))
+	if err != nil {
+		return PlanRequest{}, validation.Errors{"cycles": {message("cycles_lines")}}
+	}
 	return PlanRequest{
 		Slug: ctx.Input("slug"), Name: ctx.Input("name"), Description: ctx.Input("description"),
 		Features: strings.Split(ctx.Input("features"), "\n"), Price: price,
 		IntervalMonths: atoi(ctx.Input("interval_months")), TrialDays: atoi(ctx.Input("trial_days")),
 		GraceDays: atoi(ctx.Input("grace_days")), InstallmentsFrom: atoi(ctx.Input("installments_from")),
-		InstallmentsCap: atoi(ctx.Input("installments_cap")), Meta: meta,
+		InstallmentsCap: atoi(ctx.Input("installments_cap")), Cycles: cycles, Meta: meta,
 		Active: checked(ctx.Input("active")), Position: atoi(ctx.Input("position")),
 	}, nil
 }
@@ -806,12 +812,35 @@ func parseMeta(raw string) (Meta, error) {
 	return out, nil
 }
 
+// parseCycles reads a plan's cycles from lines of months=percent: "3=5",
+// "12=17,5". A blank line is skipped.
+func parseCycles(text string) ([]Cycle, error) {
+	var out []Cycle
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		months, percent, ok := strings.Cut(line, "=")
+		n, err := strconv.Atoi(strings.TrimSpace(months))
+		if !ok || err != nil {
+			return nil, fmt.Errorf("billing: %q is not a months=percent line", line)
+		}
+		bps, valid := parseReais(strings.TrimSuffix(strings.TrimSpace(percent), "%"))
+		if !valid {
+			return nil, fmt.Errorf("billing: %q is not a months=percent line", line)
+		}
+		out = append(out, Cycle{Months: n, Discount: bps})
+	}
+	return out, nil
+}
+
 // Migrations declares the schema this module owns, in the order the names
 // sort in, which is the order they apply in.
 func (m *Module) Migrations() []foundation.Migration {
 	return []foundation.Migration{
 		createPlans{}, createCoupons{}, createSubscriptions{},
-		createInvoices{}, createPayments{}, createCouponUsages{},
+		createInvoices{}, createPayments{}, createCouponUsages{}, addBillingCycles{},
 	}
 }
 
@@ -822,6 +851,7 @@ var (
 	_ migrations.ReversibleMigration = createInvoices{}
 	_ migrations.ReversibleMigration = createPayments{}
 	_ migrations.ReversibleMigration = createCouponUsages{}
+	_ migrations.ReversibleMigration = addBillingCycles{}
 )
 
 // createPlans is the catalogue's table.
@@ -1040,4 +1070,42 @@ func (createCouponUsages) Up(ctx context.Context, conn migrations.Connection) er
 // Down drops the table.
 func (createCouponUsages) Down(ctx context.Context, conn migrations.Connection) error {
 	return conn.Schema().DropIfExists(ctx, couponUsagesTable)
+}
+
+// addBillingCycles lets a plan sell more than one billing cycle: the cycles of
+// a plan, the cycle a subscription renews in, and the discount an invoice
+// carries for its cycle.
+type addBillingCycles struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (addBillingCycles) GetName() string { return "20261122_0007_add_billing_cycles" }
+
+// Up adds the three columns. Every row that exists keeps selling the plan's
+// own interval: no cycles, a subscription that follows the plan, an invoice
+// with no cycle discount.
+func (addBillingCycles) Up(ctx context.Context, conn migrations.Connection) error {
+	if err := conn.Schema().Table(ctx, plansTable, func(table *schema.Blueprint) {
+		table.Text("cycles").Nullable()
+	}); err != nil {
+		return err
+	}
+	if err := conn.Schema().Table(ctx, subscriptionsTable, func(table *schema.Blueprint) {
+		table.UnsignedSmallInteger("cycle_months").Default(0)
+	}); err != nil {
+		return err
+	}
+	return conn.Schema().Table(ctx, invoicesTable, func(table *schema.Blueprint) {
+		table.BigInteger("cycle_discount").Default(0)
+	})
+}
+
+// Down drops the three columns.
+func (addBillingCycles) Down(ctx context.Context, conn migrations.Connection) error {
+	if err := conn.Schema().DropColumns(ctx, invoicesTable, []string{"cycle_discount"}); err != nil {
+		return err
+	}
+	if err := conn.Schema().DropColumns(ctx, subscriptionsTable, []string{"cycle_months"}); err != nil {
+		return err
+	}
+	return conn.Schema().DropColumns(ctx, plansTable, []string{"cycles"})
 }

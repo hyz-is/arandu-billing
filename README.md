@@ -252,6 +252,18 @@ invoice's or the subscription's own account.
   refused when it is inactive, not yet valid, expired, out of uses, for another
   plan or above the price (`MinPurchase`). A price taken to zero is confirmed at
   once, with no gateway.
+- **Billing cycles.** A plan sells its own `IntervalMonths` and the cycles it
+  declares in `Cycles`, each a number of months with a discount in basis points
+  (`3` months at 500 is 5% off). A payment of `months` costs `Price x months /
+  IntervalMonths`, less the cycle's discount, rounded half up to the centavo;
+  the coupon then takes its discount off that price. The subscriber picks the
+  cycle at checkout (`SubscribeRequest.CycleMonths`, zero is the plan's own
+  interval); a cycle the plan does not offer is refused and nothing is issued.
+  Every renewal is invoiced in the cycle the subscription already has, at the
+  plan's price and discount of the day it is issued. To change cycle, renew with
+  `RenewCycle`: it applies to that invoice and, once paid, to every renewal
+  after it; the period already paid for stays as it is. A cycle the plan stopped
+  offering is refused at renewal until another is chosen.
 - **Recurring coupons.** `Renewals` is how many renewals after the first
   payment keep the discount; a renewal keeps it even if the coupon was
   deactivated afterwards. `MaxUses` counts first payments.

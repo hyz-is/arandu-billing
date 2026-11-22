@@ -14,6 +14,7 @@ type PlanResource struct {
 	ID, Slug, Name, Description      string
 	Features                         []string
 	Price                            int64
+	Cycles                           []Cycle
 	IntervalMonths, TrialDays        int
 	GraceDays, InstallmentsFrom      int
 	InstallmentsCap, MaxInstallments int
@@ -27,7 +28,7 @@ type PlanResource struct {
 func NewPlanResource(p Plan) PlanResource {
 	return PlanResource{
 		ID: p.ID, Slug: p.Slug, Name: p.Name, Description: p.Description,
-		Features: append([]string(nil), p.Features...), Price: p.Price,
+		Features: append([]string(nil), p.Features...), Price: p.Price, Cycles: append([]Cycle(nil), p.OfferedCycles()...),
 		IntervalMonths: p.IntervalMonths, TrialDays: p.TrialDays, GraceDays: p.GraceDays,
 		InstallmentsFrom: p.InstallmentsFrom, InstallmentsCap: p.InstallmentsCap,
 		MaxInstallments: p.Installments(), Meta: copyMeta(p.Meta), Active: bool(p.Active),
@@ -39,11 +40,20 @@ func NewPlanResource(p Plan) PlanResource {
 func (r PlanResource) ToArray() map[string]any {
 	return map[string]any{
 		"id": r.ID, "slug": r.Slug, "name": r.Name, "description": r.Description,
-		"features": r.Features, "price": r.Price, "interval_months": r.IntervalMonths,
+		"features": r.Features, "price": r.Price, "interval_months": r.IntervalMonths, "cycles": cyclesArray(r.Cycles),
 		"trial_days": r.TrialDays, "grace_days": r.GraceDays, "installments_from": r.InstallmentsFrom,
 		"installments_cap": r.InstallmentsCap, "max_installments": r.MaxInstallments,
 		"meta": r.Meta, "active": r.Active, "position": r.Position,
 	}
+}
+
+// cyclesArray is a plan's cycles as the JSON answer lists them.
+func cyclesArray(cycles []Cycle) []map[string]any {
+	out := make([]map[string]any, 0, len(cycles))
+	for _, c := range cycles {
+		out = append(out, map[string]any{"months": c.Months, "discount": c.Discount})
+	}
+	return out
 }
 
 // With is nothing beside the plan.
@@ -89,10 +99,13 @@ type SubscriptionResource struct {
 	TrialEndsAt, CanceledAt, EndedAt     *time.Time
 	CancelAtPeriodEnd                    bool
 	GraceDays, Renewals                  int
-	CouponID                             string
-	CouponRenewalsLeft                   int
-	Meta                                 map[string]string
-	CreatedAt                            time.Time
+	// CycleMonths is the billing cycle the subscription renews in, zero when
+	// it follows the plan's own interval.
+	CycleMonths        int
+	CouponID           string
+	CouponRenewalsLeft int
+	Meta               map[string]string
+	CreatedAt          time.Time
 }
 
 // NewSubscriptionResource copies a subscription.
@@ -102,7 +115,7 @@ func NewSubscriptionResource(s Subscription) SubscriptionResource {
 		CurrentPeriodStart: s.CurrentPeriodStart, CurrentPeriodEnd: s.CurrentPeriodEnd,
 		TrialEndsAt: s.TrialEndsAt, CanceledAt: s.CanceledAt, EndedAt: s.EndedAt,
 		CancelAtPeriodEnd: bool(s.CancelAtPeriodEnd), GraceDays: s.GraceDays, Renewals: s.Renewals,
-		CouponID: s.CouponID, CouponRenewalsLeft: s.CouponRenewalsLeft, Meta: copyMeta(s.Meta),
+		CycleMonths: s.CycleMonths, CouponID: s.CouponID, CouponRenewalsLeft: s.CouponRenewalsLeft, Meta: copyMeta(s.Meta),
 		CreatedAt: s.CreatedAt,
 	}
 }
@@ -116,7 +129,7 @@ func (r SubscriptionResource) ToArray() map[string]any {
 		"current_period_end":   r.CurrentPeriodEnd.UTC().Format(time.RFC3339),
 		"trial_ends_at":        timeText(r.TrialEndsAt), "canceled_at": timeText(r.CanceledAt),
 		"ended_at": timeText(r.EndedAt), "cancel_at_period_end": r.CancelAtPeriodEnd,
-		"renewals": r.Renewals, "meta": r.Meta,
+		"renewals": r.Renewals, "cycle_months": r.CycleMonths, "meta": r.Meta,
 	}
 }
 
@@ -129,7 +142,7 @@ type InvoiceResource struct {
 	Kind                                                      InvoiceKind
 	Status                                                    InvoiceStatus
 	Months, RenewalNumber, MaxInstallments                    int
-	Subtotal, Discount, Total                                 int64
+	Subtotal, CycleDiscount, Discount, Total                  int64
 	CouponCode, Provider, ProviderRef, CheckoutURL            string
 	Meta                                                      map[string]string
 	PaidAt                                                    *time.Time
@@ -142,7 +155,7 @@ func NewInvoiceResource(i Invoice) InvoiceResource {
 		ID: i.ID, TenantID: i.TenantID, SubscriptionID: i.SubscriptionID, PlanID: i.PlanID,
 		PlanName: i.PlanName, Reference: i.Reference, Kind: i.Kind, Status: i.Status,
 		Months: i.Months, RenewalNumber: i.RenewalNumber, MaxInstallments: i.MaxInstallments,
-		Subtotal: i.Subtotal, Discount: i.Discount, Total: i.Total, CouponCode: i.CouponCode,
+		Subtotal: i.Subtotal, CycleDiscount: i.CycleDiscount, Discount: i.Discount, Total: i.Total, CouponCode: i.CouponCode,
 		Provider: i.Provider, ProviderRef: i.ProviderRef, CheckoutURL: i.CheckoutURL,
 		Meta: copyMeta(i.Meta), PaidAt: i.PaidAt, CreatedAt: i.CreatedAt,
 	}
@@ -154,7 +167,7 @@ func (r InvoiceResource) ToArray() map[string]any {
 		"id": r.ID, "subscription_id": r.SubscriptionID, "plan_id": r.PlanID, "plan_name": r.PlanName,
 		"reference": r.Reference, "kind": string(r.Kind), "status": string(r.Status), "months": r.Months,
 		"renewal_number": r.RenewalNumber, "max_installments": r.MaxInstallments,
-		"subtotal": r.Subtotal, "discount": r.Discount, "total": r.Total, "coupon_code": r.CouponCode,
+		"subtotal": r.Subtotal, "cycle_discount": r.CycleDiscount, "discount": r.Discount, "total": r.Total, "coupon_code": r.CouponCode,
 		"provider": r.Provider, "checkout_url": r.CheckoutURL, "paid_at": timeText(r.PaidAt),
 		"created_at": r.CreatedAt.UTC().Format(time.RFC3339),
 	}

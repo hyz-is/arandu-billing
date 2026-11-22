@@ -12,6 +12,15 @@ import (
 // PlansData is what the handler hands this page.
 type PlansData = billing.PlansPageData
 
+// cycleField is the billing cycle a customer picks before paying, drawn only
+// for a plan that sells more than one.
+func cycleField(data PlansData, plan billing.PlanCard) components.SelectProps {
+	return components.SelectProps{
+		Name: "cycle", ID: "cycle-" + plan.ID, Label: data.Labels.T("field.cycle"),
+		Value: plan.DefaultCycle, Options: plan.CycleOptions, Page: data.Form(),
+	}
+}
+
 // couponField is the coupon a customer types before paying.
 func couponField(data PlansData, id string) components.FieldProps {
 	return components.FieldProps{
@@ -55,6 +64,9 @@ func couponField(data PlansData, id string) components.FieldProps {
 			@if(.CanSubscribe)
 			<form class="mt-auto grid gap-2" method="post" action="{{ plan.CheckoutURL }}">
 				@csrf
+				@if(len(plan.CycleOptions) > 1)
+				{!! components.Select(cycleField(., plan)) !!}
+				@endif
 				{!! components.Field(couponField(., plan.ID)) !!}
 				{!! components.Button(components.ButtonProps{Label: .Labels.T("control.subscribe"), Type: "submit"}) !!}
 			</form>

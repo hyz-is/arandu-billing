@@ -384,6 +384,11 @@ type PlanCard struct {
 	Features                                           []string
 	TrialDays                                          int
 	CheckoutURL, TrialURL                              string
+	// CycleOptions are the billing cycles the account may choose, each with
+	// its price: empty when the plan sells only its own interval.
+	CycleOptions []components.SelectOption
+	// DefaultCycle is the option the plan starts on: its own interval.
+	DefaultCycle string
 }
 
 // PlansPageData is the catalogue, as an account reads it.
@@ -405,6 +410,22 @@ func planCards(sc Screen, plans []*Plan) []PlanCard {
 		}
 		if n := p.Installments(); n > 1 {
 			card.Installments = sc.Labels.line("screen.installments", map[string]any{"count": strconv.Itoa(n), "amount": brl(p.Price / int64(n))})
+		}
+		if cycles := p.OfferedCycles(); len(cycles) > 1 {
+			card.DefaultCycle = strconv.Itoa(p.IntervalMonths)
+			for _, c := range cycles {
+				list, off, err := CyclePrice(*p, c.Months)
+				if err != nil {
+					continue
+				}
+				key := "screen.cycle_option"
+				replace := map[string]any{"period": sc.Labels.Months(c.Months), "price": brl(list - off)}
+				if c.Discount > 0 {
+					key = "screen.cycle_option_discount"
+					replace["percent"] = percentText(c.Discount)
+				}
+				card.CycleOptions = append(card.CycleOptions, components.SelectOption{Value: strconv.Itoa(c.Months), Label: sc.Labels.line(key, replace)})
+			}
 		}
 		out = append(out, card)
 	}
@@ -551,7 +572,9 @@ func planRows(sc Screen, rows []*Plan) []PlanRow {
 type PlanForm struct {
 	Name, Slug, Description, Features, Price, IntervalMonths, TrialDays string
 	GraceDays, InstallmentsFrom, InstallmentsCap, Position, Meta        string
-	Active                                                              bool
+	// Cycles are the plan's billing cycles as lines of months=percent.
+	Cycles string
+	Active bool
 }
 
 func planForm(p Plan) PlanForm {
@@ -569,8 +592,17 @@ func planForm(p Plan) PlanForm {
 		Price: reaisText(p.Price), IntervalMonths: strconv.Itoa(p.IntervalMonths), TrialDays: strconv.Itoa(p.TrialDays),
 		GraceDays: strconv.Itoa(p.GraceDays), InstallmentsFrom: strconv.Itoa(p.InstallmentsFrom),
 		InstallmentsCap: strconv.Itoa(p.InstallmentsCap), Position: strconv.Itoa(p.Position),
-		Meta: strings.Join(meta, "\n"), Active: bool(p.Active),
+		Meta: strings.Join(meta, "\n"), Cycles: cycleLines(p.Cycles), Active: bool(p.Active),
 	}
+}
+
+// cycleLines is a plan's cycles as the form types them: "3=5", "12=17,5".
+func cycleLines(cycles []Cycle) string {
+	lines := make([]string, 0, len(cycles))
+	for _, c := range cycles {
+		lines = append(lines, strconv.Itoa(c.Months)+"="+strings.TrimSuffix(percentText(c.Discount), "%"))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // AdminPlanPageData is one plan, with the form that changes it.

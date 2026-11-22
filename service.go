@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -121,6 +122,10 @@ type PlanRequest struct {
 	InstallmentsFrom int
 	// InstallmentsCap is the most installments; zero is MaxInstallments.
 	InstallmentsCap int
+	// Cycles are the billing cycles besides IntervalMonths a subscriber may
+	// choose, each with its discount; empty offers only IntervalMonths. A
+	// cycle may repeat IntervalMonths to discount it.
+	Cycles []Cycle
 	// Meta is the consumer's own facts about the plan.
 	Meta Meta
 	// Active says the plan is offered.
@@ -173,6 +178,21 @@ func (r PlanRequest) Validate() validation.Errors {
 	if len(r.Meta) > 40 {
 		e.Add("meta", message("meta_count", translation.Replace{"max": "40"}))
 	}
+	if len(r.Cycles) > MaxCycles {
+		e.Add("cycles", message("cycles_count", translation.Replace{"max": itoa(MaxCycles)}))
+	}
+	seen := map[int]bool{}
+	for _, c := range r.Cycles {
+		switch {
+		case c.Months < 1 || c.Months > MaxIntervalMonths:
+			e.Add("cycles", message("between", translation.Replace{"min": "1", "max": itoa(MaxIntervalMonths)}))
+		case c.Discount < 0 || c.Discount > MaxCycleDiscount:
+			e.Add("cycles", message("percent"))
+		case seen[c.Months]:
+			e.Add("cycles", message("cycles_repeated"))
+		}
+		seen[c.Months] = true
+	}
 	return e
 }
 
@@ -187,6 +207,8 @@ func (r PlanRequest) apply(p *Plan, now time.Time) {
 	p.GraceDays = r.GraceDays
 	p.InstallmentsFrom = r.InstallmentsFrom
 	p.InstallmentsCap = r.InstallmentsCap
+	p.Cycles = append(CycleList(nil), r.Cycles...)
+	sort.SliceStable(p.Cycles, func(i, j int) bool { return p.Cycles[i].Months < p.Cycles[j].Months })
 	p.Meta = r.Meta
 	if p.Meta == nil {
 		p.Meta = Meta{}
@@ -258,7 +280,7 @@ func (s *BillingService) CreatePlan(ctx context.Context, actor security.Subject,
 	if _, err := p.Save(ctx, g); err != nil {
 		return nil, err
 	}
-	return p, s.record(ctx, g, actor, activityPlanCreated, "billing_plan", p.ID, map[string]any{"slug": p.Slug, "price": p.Price, "months": p.IntervalMonths})
+	return p, s.record(ctx, g, actor, activityPlanCreated, "billing_plan", p.ID, map[string]any{"slug": p.Slug, "price": p.Price, "months": p.IntervalMonths, "cycles": p.Cycles})
 }
 
 // UpdatePlan changes a plan. The subscriptions already sold keep the period
@@ -283,13 +305,13 @@ func (s *BillingService) UpdatePlan(ctx context.Context, actor security.Subject,
 	if taken {
 		return nil, validation.Errors{"slug": {message("slug_taken")}}
 	}
-	before := map[string]any{"price": p.Price, "months": p.IntervalMonths, "active": bool(p.Active)}
+	before := map[string]any{"price": p.Price, "months": p.IntervalMonths, "cycles": p.Cycles, "active": bool(p.Active)}
 	in.apply(p, s.now())
 	if _, err := p.Save(ctx, g); err != nil {
 		return nil, err
 	}
 	return p, s.record(ctx, g, actor, activityPlanUpdated, "billing_plan", p.ID, map[string]any{
-		"before": before, "after": map[string]any{"price": p.Price, "months": p.IntervalMonths, "active": bool(p.Active)},
+		"before": before, "after": map[string]any{"price": p.Price, "months": p.IntervalMonths, "cycles": p.Cycles, "active": bool(p.Active)},
 	})
 }
 

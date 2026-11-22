@@ -263,7 +263,7 @@ func (s *BillingService) confirm(ctx context.Context, g security.Grant, actor se
 			return err
 		}
 		if err := s.record(ctx, g, actor, activityInvoicePaid, "billing_invoice", inv.ID, map[string]any{
-			"total": inv.Total, "provider": providerName, "method": payment.Method, "subscription": sub.ID,
+			"total": inv.Total, "cycle": inv.Months, "provider": providerName, "method": payment.Method, "subscription": sub.ID,
 			"paid_until": sub.CurrentPeriodEnd.UTC().Format(time.RFC3339),
 		}); err != nil {
 			return err
@@ -319,6 +319,7 @@ func (s *BillingService) extend(ctx context.Context, g security.Grant, inv *Invo
 		created.Status = SubscriptionActive
 		created.CurrentPeriodStart, created.CurrentPeriodEnd = period.Start, period.End
 		created.GraceDays = plan.GraceDays
+		created.CycleMonths = cycleToStore(plan, inv.Months)
 		if coupon != nil {
 			created.CouponID, created.CouponRenewalsLeft = coupon.ID, coupon.Renewals
 		}
@@ -359,6 +360,7 @@ func (s *BillingService) extend(ctx context.Context, g security.Grant, inv *Invo
 		sub.Renewals++
 	}
 	sub.Status = SubscriptionActive
+	sub.CycleMonths = cycleToStore(plan, inv.Months)
 	sub.CurrentPeriodStart, sub.CurrentPeriodEnd = period.Start, period.End
 	sub.CancelAtPeriodEnd = false
 	sub.UpdatedAt = now
@@ -366,6 +368,16 @@ func (s *BillingService) extend(ctx context.Context, g security.Grant, inv *Invo
 		return nil, "", err
 	}
 	return sub, event, nil
+}
+
+// cycleToStore is the cycle a paid invoice leaves on its subscription: the
+// months it bought, or zero when they are the plan's own IntervalMonths, so a
+// subscription that never chose a cycle keeps following the plan.
+func cycleToStore(plan *Plan, months int) int {
+	if months == plan.IntervalMonths {
+		return 0
+	}
+	return months
 }
 
 // ManualPayment is what the admin records when a payment arrived outside a
