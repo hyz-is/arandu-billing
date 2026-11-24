@@ -1,5 +1,50 @@
 # Upgrade Guide
 
+## v0.4.0
+
+### Units
+
+Run `aru migrate`: the migration `20261124_0008_add_billing_units` adds
+`billing_plans.included_units` and `unit_price`, `billing_subscriptions.units`
+and `billing_invoices.units` and `units_amount`. Nothing is removed, and every
+plan, subscription and invoice that exists keeps its price: a plan with no
+`UnitPrice` sells no unit beyond the one it includes.
+
+- `Invoice.Subtotal` and `CheckoutRequest.Subtotal` now include
+  `UnitsAmount`, the part the units above the included ones cost. For an invoice
+  with no units `UnitsAmount` is zero and the fields read as before. A gateway
+  that charges `CheckoutRequest.Total` needs no change.
+- `PriceCycle` and `Price` are unchanged; `PriceUnits` is `PriceCycle` for a
+  number of units.
+- `SubscribeRequest.Units` is the number to charge for at checkout; a
+  subscription that is being served changes its units with
+  `BillingService.SetUnits`, which charges nothing and applies from the next
+  invoice.
+### Subscriptions a gateway holds
+
+Run `aru migrate` for `20261124_0009_add_gateway_subscriptions`: `provider` and
+`provider_ref` on `billing_subscriptions`, `charge_ref` on `billing_invoices`, and
+two partial unique indexes. Nothing is removed, and a provider that does not
+fill the new fields behaves as before.
+
+- A Provider that holds subscriptions fills `Notification.SubscriptionRef`,
+  `Units` and `SubscriptionState`, and `PaymentStatus.SubscriptionRef`; see the
+  README. `HandleNotification` may now answer a nil invoice with a nil error (a
+  notification about a subscription, or a charge already paid for): code that
+  calls it directly checks for it. The notification address answers 200 for it.
+- The policy has one more action, `RenewalsRecord`, open to this package's
+  system subject only. A test that walks every action lists it.
+- `billingtest.Gateway.QueryStatus` also looks a status up by the `Reference`
+  asked for, which is how a renewal the gateway charged is paid in tests.
+
+- Republish the views to get the units fields of the plan form:
+
+```sh
+aru vendor:publish --tag=view
+aru vendor:publish --tag=view --apply
+aru view:build
+```
+
 ## v0.3.0
 
 ### Billing cycles

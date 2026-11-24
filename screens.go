@@ -574,7 +574,10 @@ type PlanForm struct {
 	GraceDays, InstallmentsFrom, InstallmentsCap, Position, Meta        string
 	// Cycles are the plan's billing cycles as lines of months=percent.
 	Cycles string
-	Active bool
+	// IncludedUnits and UnitPrice are the units the price covers and what each
+	// extra one costs, as the form types them.
+	IncludedUnits, UnitPrice string
+	Active                   bool
 }
 
 func planForm(p Plan) PlanForm {
@@ -593,6 +596,7 @@ func planForm(p Plan) PlanForm {
 		GraceDays: strconv.Itoa(p.GraceDays), InstallmentsFrom: strconv.Itoa(p.InstallmentsFrom),
 		InstallmentsCap: strconv.Itoa(p.InstallmentsCap), Position: strconv.Itoa(p.Position),
 		Meta: strings.Join(meta, "\n"), Cycles: cycleLines(p.Cycles), Active: bool(p.Active),
+		IncludedUnits: strconv.Itoa(p.IncludedUnits), UnitPrice: reaisText(p.UnitPrice),
 	}
 }
 

@@ -11,6 +11,9 @@
         "coupon": "Coupon",
         "cycle": "Billing cycle",
         "cycles": "Billing cycles",
+        "included_units": "Units included",
+        "unit_price": "Price per extra unit",
+        "units": "Units",
         "created_at": "Created",
         "description": "Description",
         "discount": "Discount",
@@ -85,6 +88,8 @@
         "features_hint": "One per line.",
         "meta_hint": "One name=value per line, read by the application.",
         "cycles_hint": "One months=percent per line, for example 3=5 or 12=17,5. The plan's own period is always offered.",
+        "included_units_hint": "How many units (seats, members) the price already covers. Zero is one.",
+        "unit_price_hint": "What each unit above the included ones adds per payment period. Zero sells no extra units.",
         "cycle_option": ":period — :price",
         "cycle_option_discount": ":period — :price (:percent off)",
         "installments_from_hint": "Zero never offers installments.",
@@ -186,7 +191,8 @@
         "subscription_cancel_scheduled": "Cancellation at period end requested",
         "subscription_cancel_withdrawn": "Cancellation withdrawn",
         "subscription_moved": "Subscription status changed",
-        "subscription_started": "Trial started"
+        "subscription_started": "Trial started",
+        "subscription_units_changed": "Units changed"
     },
     "validation": {
         "summary": ":field :message",
@@ -211,6 +217,7 @@
         "plan_unknown": "is not a plan of the catalogue",
         "plan_inactive": "is no longer on offer",
         "cycle_unavailable": "is not offered for this plan",
+        "units_unavailable": "is more than this plan sells",
         "cycles_lines": "must be months=percent lines",
         "cycles_count": "has more than :max cycles",
         "cycles_repeated": "repeats a cycle",

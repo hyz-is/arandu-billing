@@ -10,6 +10,71 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
+### Added
+
+- Units (seats, members). A plan may include a number of units in its price and
+  sell more at a price each: `Plan.IncludedUnits` (zero is one) and
+  `Plan.UnitPrice` (centavos per unit above the included ones, for one
+  `IntervalMonths`; zero sells none, and units above the included ones are
+  refused). `PlanRequest` carries both, validated, and the admin's plan form has
+  the `included_units` and `unit_price_brl` fields, in en and pt-BR.
+- The pure rules `PriceUnits`, `UnitsPrice`, `Plan.Included`, `MaxUnits` (1000)
+  and `ErrUnitsUnavailable`. The units cost
+  `max(units - included, 0) * UnitPrice * months / IntervalMonths`, rounded half
+  up to the centavo, and join the price for the months in `Quote.Subtotal`; the
+  cycle's discount and the coupon take their discounts off that subtotal.
+  `Quote.UnitsAmount` is the part the units cost. `Price` and `PriceCycle` keep
+  their signatures and price no units.
+- `Subscription.Units`, `Invoice.Units`, `Invoice.UnitsAmount`,
+  `SubscribeRequest.Units`, `CheckoutRequest.Units` and
+  `CheckoutRequest.UnitsAmount`; `Renew` and `RenewCycle` invoice the units the
+  subscription has. The resources and their JSON carry the new fields.
+- `BillingService.SetUnits` changes the units of one of the account's
+  subscriptions from its next invoice on, between 1 and `MaxUnits`. It issues no
+  invoice and collects nothing, and records `subscription.units_changed` with
+  the units before and after.
+- The migration `20261124_0008_add_billing_units`: `included_units` and
+  `unit_price` on the plans, `units` on the subscriptions, `units` and
+  `units_amount` on the invoices, every existing row keeping its price. Run
+  `aru migrate`.
+
+- Subscriptions a gateway holds and renews by itself. `Subscription.Provider`
+  and `Subscription.ProviderRef` (unique together when not empty) are filled
+  when an invoice is confirmed with `PaymentStatus.SubscriptionRef` or
+  `Notification.SubscriptionRef`. `Notification` gains `SubscriptionRef`,
+  `Units` and `SubscriptionState`; `PaymentStatus` gains `SubscriptionRef`.
+- `HandleNotification` also handles, in this order, a notification about a
+  subscription's state (`SubscriptionState` set and no invoice named: past_due,
+  expired, canceled, or active while the period is ahead, once, answering a nil
+  invoice), the invoice a notification names, and the renewal a gateway charged
+  by itself (no invoice has the `Reference`, but a subscription holds the
+  `SubscriptionRef`): the invoice is issued without a checkout, for the
+  subscription's cycle and units, and confirmed through `QueryStatus` against
+  its total. A charge repeated or racing is invoiced once, recorded under
+  `Invoice.ChargeRef`, and a subscription already paid for more than half a
+  cycle ahead is not invoiced again. The notification address answers 200 with
+  `{"status":"ok"}` when there is no invoice to answer.
+- `BillingService.SetProviderUnits`, `SetUnits` for the system when the gateway
+  reports the units.
+- The action `RenewalsRecord`, answered for this package's system subject alone.
+- `billingtest.Gateway` plays a gateway with subscriptions: `Renew`,
+  `PayCharge`, `PaySubscription`, `ChargeNotification`, `StateNotification` and
+  `SubscriptionNotification`.
+- The migration `20261124_0009_add_gateway_subscriptions`: `provider` and
+  `provider_ref` on the subscriptions and `charge_ref` on the invoices, with a
+  partial unique index on `(provider, provider_ref)` and on `(provider,
+  charge_ref)` where the identifier is not empty. Run `aru migrate`.
+
+### Changed
+
+- A subscription moved by a gateway's notice back to active has its end,
+  cancellation and cancel-at-period-end cleared and raises
+  `subscription.activated`.
+- The generated queries are regenerated with the current model generator; they
+  gain `ApplyListing` and `Listing` and lose nothing.
+
 ## [0.3.0] - 2026-11-22
 
 ### Added

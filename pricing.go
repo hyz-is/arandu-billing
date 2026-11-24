@@ -12,8 +12,11 @@ import (
 // Quote is what one period of a plan costs in a billing cycle, with a coupon.
 type Quote struct {
 	// Subtotal is the plan's price for the cycle's months at its own rate,
-	// before any discount, in centavos.
+	// plus UnitsAmount, before any discount, in centavos.
 	Subtotal int64
+	// UnitsAmount is the part of Subtotal that the units above the plan's
+	// included ones cost for the cycle's months, in centavos.
+	UnitsAmount int64
 	// CycleDiscount is what the billing cycle takes off Subtotal, in
 	// centavos.
 	CycleDiscount int64
@@ -120,20 +123,87 @@ func CyclePrice(p Plan, months int) (list, discount int64, err error) {
 // roundDiv is a divided by b, rounded half up; both are positive.
 func roundDiv(a, b int64) int64 { return (a + b/2) / b }
 
-// PriceCycle is Price for a payment of months months: the billing cycle's
-// discount comes off first and the coupon takes its discount off what is
-// left, so the coupon's minimum purchase is read against that price. Zero
-// months is the plan's own IntervalMonths.
-func PriceCycle(p Plan, months int, c *Coupon, renewal bool, at time.Time) (Quote, error) {
+// MaxUnits is the most units (seats, members) one subscription may be charged
+// for.
+const MaxUnits = 1000
+
+// ErrUnitsUnavailable says the plan does not sell the units asked for: more
+// than MaxUnits, a negative number, or more than the plan includes on a plan
+// with no UnitPrice.
+var ErrUnitsUnavailable = errors.New("billing: the plan does not sell that many units")
+
+// Included is how many units the plan's price covers: IncludedUnits, and one
+// when that is zero.
+func (p Plan) Included() int {
+	if p.IncludedUnits < 1 {
+		return 1
+	}
+	return p.IncludedUnits
+}
+
+// UnitsPrice is what the units above the plan's included ones cost for months
+// months: UnitPrice for each, scaled from IntervalMonths to the months and
+// rounded half up to the centavo. Zero units, or no more than the plan
+// includes, cost nothing; more than that on a plan with no UnitPrice, or more
+// than MaxUnits, is ErrUnitsUnavailable.
+//
+//	UnitPrice 2000, IntervalMonths 1, Included 1: 3 units, 12 months -> 48000
+func UnitsPrice(p Plan, months, units int) (int64, error) {
+	if units < 0 || units > MaxUnits {
+		return 0, ErrUnitsUnavailable
+	}
+	extra := units - p.Included()
+	if extra <= 0 {
+		return 0, nil
+	}
+	if p.UnitPrice <= 0 {
+		return 0, ErrUnitsUnavailable
+	}
 	if months == 0 {
 		months = p.IntervalMonths
 	}
-	list, off, err := CyclePrice(p, months)
+	interval := int64(p.IntervalMonths)
+	if interval < 1 {
+		interval = 1
+	}
+	return roundDiv(int64(extra)*p.UnitPrice*int64(months), interval), nil
+}
+
+// PriceCycle is Price for a payment of months months: the billing cycle's
+// discount comes off first and the coupon takes its discount off what is
+// left, so the coupon's minimum purchase is read against that price. Zero
+// months is the plan's own IntervalMonths. It prices no units above the ones
+// the plan includes; PriceUnits does.
+func PriceCycle(p Plan, months int, c *Coupon, renewal bool, at time.Time) (Quote, error) {
+	return PriceUnits(p, months, 0, c, renewal, at)
+}
+
+// PriceUnits is PriceCycle for a subscription charged for units units: the
+// plan's price for the months, plus what the units above the included ones
+// cost (UnitsPrice), is the Subtotal the cycle's discount and then the
+// coupon's discount come off.
+//
+//	Price 11990, UnitPrice 2000, Included 1, IntervalMonths 1: 3 units -> 15990
+func PriceUnits(p Plan, months, units int, c *Coupon, renewal bool, at time.Time) (Quote, error) {
+	if months == 0 {
+		months = p.IntervalMonths
+	}
+	cycle, err := p.Cycle(months)
 	if err != nil {
 		return Quote{}, err
 	}
+	base, _, err := CyclePrice(p, cycle.Months)
+	if err != nil {
+		return Quote{}, err
+	}
+	extra, err := UnitsPrice(p, cycle.Months, units)
+	if err != nil {
+		return Quote{}, err
+	}
+	list := base + extra
+	off := list - roundDiv(list*(10000-cycle.Discount), 10000)
 	price := list - off
-	q := Quote{Subtotal: list, CycleDiscount: off, Total: price, MaxInstallments: p.InstallmentsFor(months)}
+	q := Quote{Subtotal: list, UnitsAmount: extra, CycleDiscount: off, Total: price, MaxInstallments: p.InstallmentsFor(cycle.Months)}
 	if c == nil {
 		return q, nil
 	}

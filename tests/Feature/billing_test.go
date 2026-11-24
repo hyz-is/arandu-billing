@@ -521,7 +521,7 @@ func TestTheModuleDeclaresItsSchemaAndRefusesABadWiring(t *testing.T) {
 		"20261023_0001_create_billing_plans", "20261023_0002_create_billing_coupons",
 		"20261023_0003_create_billing_subscriptions", "20261023_0004_create_billing_invoices",
 		"20261023_0005_create_billing_payments", "20261023_0006_create_billing_coupon_usages",
-		"20261122_0007_add_billing_cycles",
+		"20261122_0007_add_billing_cycles", "20261124_0008_add_billing_units", "20261124_0009_add_gateway_subscriptions",
 	}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Errorf("the migrations are %v", names)

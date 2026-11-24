@@ -39,6 +39,11 @@ const (
 	// SubscriptionsSweep is moving the subscriptions whose period ended. It is
 	// answered for this package's own system subject alone.
 	SubscriptionsSweep security.Action = "billing.subscriptions.sweep"
+	// RenewalsRecord is recording what a gateway did on its own side: a
+	// renewal it charged and a change of state or units of a subscription it
+	// holds. It is answered for this package's own system subject alone, after
+	// the notification's provider was asked again.
+	RenewalsRecord security.Action = "billing.renewals.record"
 	// AdminAction is being this package's admin, held as an action: what an
 	// application whose permissions arandu-permission administers puts in a
 	// group. It opens what AdminRole opens, and nothing more.
@@ -139,13 +144,13 @@ func (BillingPolicy) Can(ctx context.Context, s security.Subject, a security.Act
 
 	// arandu:begin custom
 	// This package's own subject, inside the one tenant it was built for, and
-	// for the two acts that have no session behind them.
+	// for the acts that have no session behind them.
 	if s.ID == systemSubjectID && s.HasRole(systemRole) {
 		if record.TenantID != "" && record.TenantID != s.Tenant {
 			return fmt.Errorf("the system subject of %s acts on no other account", s.Tenant)
 		}
 		switch a {
-		case PaymentsConfirm, SubscriptionsSweep:
+		case PaymentsConfirm, SubscriptionsSweep, RenewalsRecord:
 			return nil
 		}
 		return fmt.Errorf("no rule allows %s to the system subject", a)
