@@ -36,6 +36,8 @@ type Subscription struct {
 	GraceDays          int        `db:"grace_days"`
 	CouponID           string     `db:"coupon_id"`
 	CouponRenewalsLeft int        `db:"coupon_renewals_left"`
+	Provider           string     `db:"provider"`
+	ProviderRef        string     `db:"provider_ref"`
 	Renewals           int        `db:"renewals"`
 	CreatedBy          string     `db:"created_by"`
 	CreatedAt          time.Time  `db:"created_at"`

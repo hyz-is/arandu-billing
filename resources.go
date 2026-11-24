@@ -111,11 +111,14 @@ type SubscriptionResource struct {
 	CycleMonths int
 	// Units is how many units the subscription is charged for, zero when only
 	// the plan's included ones.
-	Units              int
-	CouponID           string
-	CouponRenewalsLeft int
-	Meta               map[string]string
-	CreatedAt          time.Time
+	Units int
+	// Provider and ProviderRef name the gateway holding the subscription and
+	// its identifier there, empty for one the gateway does not hold.
+	Provider, ProviderRef string
+	CouponID              string
+	CouponRenewalsLeft    int
+	Meta                  map[string]string
+	CreatedAt             time.Time
 }
 
 // NewSubscriptionResource copies a subscription.
@@ -125,7 +128,7 @@ func NewSubscriptionResource(s Subscription) SubscriptionResource {
 		CurrentPeriodStart: s.CurrentPeriodStart, CurrentPeriodEnd: s.CurrentPeriodEnd,
 		TrialEndsAt: s.TrialEndsAt, CanceledAt: s.CanceledAt, EndedAt: s.EndedAt,
 		CancelAtPeriodEnd: bool(s.CancelAtPeriodEnd), GraceDays: s.GraceDays, Renewals: s.Renewals,
-		CycleMonths: s.CycleMonths, Units: s.Units, CouponID: s.CouponID, CouponRenewalsLeft: s.CouponRenewalsLeft, Meta: copyMeta(s.Meta),
+		CycleMonths: s.CycleMonths, Units: s.Units, Provider: s.Provider, ProviderRef: s.ProviderRef, CouponID: s.CouponID, CouponRenewalsLeft: s.CouponRenewalsLeft, Meta: copyMeta(s.Meta),
 		CreatedAt: s.CreatedAt,
 	}
 }

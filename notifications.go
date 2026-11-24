@@ -36,6 +36,10 @@ func (m *Module) CSRFExemptPaths() []string { return []string{m.cfg.Notification
 func (m *Module) notify(ctx *fhttp.Context) error {
 	inv, err := m.svc.HandleNotification(ctx.Ctx(), ctx.Param("provider"), ctx.Request)
 	switch {
+	case err == nil && inv == nil:
+		// A notification about a subscription, or a charge already paid for:
+		// handled, and no invoice to answer.
+		return ctx.JSON(stdhttp.StatusOK, fieldsResource{"status": "ok"})
 	case err == nil:
 		return ctx.JSON(stdhttp.StatusOK, fieldsResource{"id": inv.ID, "status": string(inv.Status)})
 	case errors.Is(err, ErrBadNotification):

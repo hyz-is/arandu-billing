@@ -842,7 +842,7 @@ func parseCycles(text string) ([]Cycle, error) {
 func (m *Module) Migrations() []foundation.Migration {
 	return []foundation.Migration{
 		createPlans{}, createCoupons{}, createSubscriptions{},
-		createInvoices{}, createPayments{}, createCouponUsages{}, addBillingCycles{}, addBillingUnits{},
+		createInvoices{}, createPayments{}, createCouponUsages{}, addBillingCycles{}, addBillingUnits{}, addGatewaySubscriptions{},
 	}
 }
 
@@ -855,6 +855,7 @@ var (
 	_ migrations.ReversibleMigration = createCouponUsages{}
 	_ migrations.ReversibleMigration = addBillingCycles{}
 	_ migrations.ReversibleMigration = addBillingUnits{}
+	_ migrations.ReversibleMigration = addGatewaySubscriptions{}
 )
 
 // createPlans is the catalogue's table.
@@ -1150,4 +1151,57 @@ func (addBillingUnits) Down(ctx context.Context, conn migrations.Connection) err
 		return err
 	}
 	return conn.Schema().DropColumns(ctx, plansTable, []string{"included_units", "unit_price"})
+}
+
+// The partial unique indexes of addGatewaySubscriptions. Both are written as
+// statements because the schema builder has no partial index, and both are
+// plain CREATE UNIQUE INDEX ... WHERE, which SQLite and PostgreSQL read alike.
+const (
+	subscriptionProviderRefIndex = "billing_subscriptions_provider_ref_uq"
+	invoiceChargeRefIndex        = "billing_invoices_charge_ref_uq"
+)
+
+// addGatewaySubscriptions lets a gateway hold a subscription of its own and
+// charge its renewals by itself: the gateway and its identifier on the
+// subscription, and the gateway's identifier of a charge it made on the
+// invoice that records it.
+type addGatewaySubscriptions struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (addGatewaySubscriptions) GetName() string { return "20261124_0009_add_gateway_subscriptions" }
+
+// Up adds the columns and the two unique indexes that apply only where the
+// identifier is not empty, so a row that never touched a gateway is outside
+// them: a gateway's subscription is held by one subscription, and a charge of
+// the gateway is invoiced once.
+func (addGatewaySubscriptions) Up(ctx context.Context, conn migrations.Connection) error {
+	if err := conn.Schema().Table(ctx, subscriptionsTable, func(table *schema.Blueprint) {
+		table.String("provider", maxShortLen).Default("")
+		table.String("provider_ref", maxIdentifierLen).Default("")
+	}); err != nil {
+		return err
+	}
+	if err := conn.Schema().Table(ctx, invoicesTable, func(table *schema.Blueprint) {
+		table.String("charge_ref", maxIdentifierLen).Default("")
+	}); err != nil {
+		return err
+	}
+	if _, err := conn.Statement(ctx, "CREATE UNIQUE INDEX "+subscriptionProviderRefIndex+" ON "+subscriptionsTable+" (provider, provider_ref) WHERE provider_ref <> ''", nil); err != nil {
+		return err
+	}
+	_, err := conn.Statement(ctx, "CREATE UNIQUE INDEX "+invoiceChargeRefIndex+" ON "+invoicesTable+" (provider, charge_ref) WHERE charge_ref <> ''", nil)
+	return err
+}
+
+// Down drops the indexes and the columns.
+func (addGatewaySubscriptions) Down(ctx context.Context, conn migrations.Connection) error {
+	for _, index := range []string{invoiceChargeRefIndex, subscriptionProviderRefIndex} {
+		if _, err := conn.Statement(ctx, "DROP INDEX IF EXISTS "+index, nil); err != nil {
+			return err
+		}
+	}
+	if err := conn.Schema().DropColumns(ctx, invoicesTable, []string{"charge_ref"}); err != nil {
+		return err
+	}
+	return conn.Schema().DropColumns(ctx, subscriptionsTable, []string{"provider", "provider_ref"})
 }

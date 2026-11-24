@@ -115,6 +115,22 @@ type Notification struct {
 	InvoiceID string
 	// Reference is the gateway's own identifier of the order or payment.
 	Reference string
+	// SubscriptionRef is the gateway's identifier of the subscription the
+	// notification is about, when the gateway holds subscriptions of its own.
+	// With a Reference and no invoice that has it, it names the subscription
+	// whose renewal the gateway charged; with SubscriptionState it names the
+	// subscription whose state changed. An invoice that is confirmed binds
+	// the subscription to it.
+	SubscriptionRef string
+	// Units is how many units (seats, members) the gateway charges the
+	// subscription for; zero says it did not tell.
+	Units int
+	// SubscriptionState, when it is set, makes the notification about the
+	// subscription and not about a payment: the state the gateway moved it to.
+	// Only SubscriptionPastDue, SubscriptionExpired, SubscriptionCanceled and
+	// SubscriptionActive are accepted. A notification that names an invoice is
+	// about that invoice, and the state is not read.
+	SubscriptionState SubscriptionStatus
 	// Fields are whatever else the Provider wants QueryStatus to see.
 	Fields map[string]string
 }
@@ -159,6 +175,11 @@ type PaymentStatus struct {
 	Installments int
 	// Reference is the gateway's identifier of the payment.
 	Reference string
+	// SubscriptionRef is the gateway's identifier of the subscription the
+	// payment belongs to, empty when it is not a subscription's. A payment
+	// that confirms an invoice binds the invoice's subscription to it, and a
+	// notification's SubscriptionRef stands in when this is empty.
+	SubscriptionRef string
 	// PaidAt is when it was paid; zero is now.
 	PaidAt time.Time
 	// Raw is the gateway's own word for the state, recorded on the invoice.

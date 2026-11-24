@@ -514,8 +514,9 @@ func (s *BillingService) CancelNow(ctx context.Context, actor security.Subject, 
 	return sub, nil
 }
 
-// move puts a subscription in an ended or lapsed status, records it and tells
-// the Listener, in one transaction.
+// move puts a subscription in another status -- lapsed, ended, or served again
+// when the gateway that holds it says so --, records it and tells the Listener,
+// in one transaction.
 func (s *BillingService) move(ctx context.Context, g security.Grant, actor security.Subject, sub *Subscription, to SubscriptionStatus, now time.Time) error {
 	from := sub.Status
 	plan, err := Plans(s.db).WhereKey(sub.PlanID).FirstOrFail(ctx, g)
@@ -544,6 +545,12 @@ func (s *BillingService) move(ctx context.Context, g security.Grant, actor secur
 				return err
 			}
 		}
+		if to == SubscriptionActive {
+			sub.EndedAt, sub.CanceledAt, sub.CancelAtPeriodEnd = nil, nil, false
+			if _, err := sub.Save(ctx, g); err != nil {
+				return err
+			}
+		}
 		if err := s.record(ctx, g, actor, activitySubscriptionMoved, "billing_subscription", sub.ID, map[string]any{
 			"before": string(from), "after": string(to),
 		}); err != nil {
@@ -555,6 +562,8 @@ func (s *BillingService) move(ctx context.Context, g security.Grant, actor secur
 			name = EventPastDue
 		case SubscriptionCanceled:
 			name = EventCanceled
+		case SubscriptionActive:
+			name = EventActivated
 		}
 		return s.emit(ctx, Event{Name: name, Tenant: sub.TenantID, At: now,
 			Subscription: NewSubscriptionResource(*sub), Plan: NewPlanResource(*plan), Grant: g})

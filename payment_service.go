@@ -21,14 +21,31 @@ func missing(err error) bool {
 }
 
 // HandleNotification is what a gateway's post to its notification address
-// does: the provider named reads the request, the invoice it names is looked
-// up across every account, the gateway is asked again where the payment
-// stands, and only then is anything confirmed -- once, however many times the
-// gateway posts.
+// does: the provider named reads the request and, in this order,
+//
+//  1. a notification that carries a SubscriptionState and names no invoice is
+//     about the subscription the gateway holds: it is taken to that state and
+//     the units the notification reports are kept (subscriptionStated), once
+//     -- the same notice again changes nothing. The answer is a nil invoice
+//     and a nil error, because no invoice is involved;
+//  2. a notification that names an invoice, by its ID or by the gateway's
+//     Reference, confirms that invoice: it is looked up across every account,
+//     the gateway is asked again where the payment stands, and only then is
+//     anything confirmed -- once, however many times the gateway posts;
+//  3. a notification that names no invoice this package has, but carries a
+//     Reference and the SubscriptionRef of a subscription the gateway holds,
+//     is a renewal the gateway charged by itself: the invoice is issued here
+//     without asking for a checkout and confirmed as in 2 (renewalCharged). A
+//     charge the subscription already pays for answers a nil invoice and a nil
+//     error.
+//
+// Nothing the notification says is believed about money, but its state and
+// units are taken as the Provider read them: a Provider authenticates what the
+// gateway posted, in ParseNotification, before it returns it.
 //
 // It answers the invoice as it stands afterwards. A request the provider does
-// not recognise wraps ErrBadNotification; an invoice that is not there, or a
-// provider that is not configured, is ErrNotFound.
+// not recognise wraps ErrBadNotification; an invoice or subscription that is
+// not there, or a provider that is not configured, is ErrNotFound.
 func (s *BillingService) HandleNotification(ctx context.Context, providerName string, r *http.Request) (*Invoice, error) {
 	provider := s.providers[providerName]
 	if provider == nil {
@@ -41,20 +58,41 @@ func (s *BillingService) HandleNotification(ctx context.Context, providerName st
 		}
 		return nil, fmt.Errorf("%w: %v", ErrBadNotification, err)
 	}
-	if strings.TrimSpace(n.InvoiceID) == "" && strings.TrimSpace(n.Reference) == "" {
-		return nil, fmt.Errorf("%w: it names no invoice", ErrBadNotification)
+	id, reference := strings.TrimSpace(n.InvoiceID), strings.TrimSpace(n.Reference)
+	n.SubscriptionRef = strings.TrimSpace(n.SubscriptionRef)
+	if id == "" && reference == "" {
+		if n.SubscriptionState == "" {
+			return nil, fmt.Errorf("%w: it names no invoice", ErrBadNotification)
+		}
+		switch n.SubscriptionState {
+		case SubscriptionPastDue, SubscriptionExpired, SubscriptionCanceled, SubscriptionActive:
+		default:
+			return nil, fmt.Errorf("%w: it moves a subscription to %q", ErrBadNotification, n.SubscriptionState)
+		}
+		if n.SubscriptionRef == "" {
+			return nil, fmt.Errorf("%w: it names no subscription", ErrBadNotification)
+		}
+		return nil, s.subscriptionStated(ctx, providerName, &n)
 	}
 	probe, err := security.Authorize(ctx, s.policy, systemSubject(lookupTenant), PaymentsConfirm, Account{})
 	if err != nil {
 		return nil, err
 	}
 	lookup := everytenant.Invoices(s.db).Where("provider", "=", providerName)
-	if id := strings.TrimSpace(n.InvoiceID); id != "" {
+	if id != "" {
 		lookup = lookup.WhereKey(id)
 	} else {
-		lookup = lookup.Where("provider_ref", "=", strings.TrimSpace(n.Reference))
+		lookup = lookup.Where("provider_ref", "=", reference)
 	}
 	row, err := lookup.FirstOrFail(ctx, probe)
+	if err != nil && missing(err) && reference != "" && n.SubscriptionRef != "" {
+		// A charge of the gateway's is recorded under its own reference even
+		// after the confirmation replaced the invoice's provider reference.
+		row, err = everytenant.Invoices(s.db).Where("provider", "=", providerName).Where("charge_ref", "=", reference).FirstOrFail(ctx, probe)
+		if err != nil && missing(err) {
+			return s.renewalCharged(ctx, provider, &n)
+		}
+	}
 	if err != nil {
 		return nil, notFound(err)
 	}
@@ -112,6 +150,9 @@ func (s *BillingService) settle(ctx context.Context, g security.Grant, who secur
 	}
 	if st.Reference == "" {
 		st.Reference = ref
+	}
+	if st.SubscriptionRef == "" && n != nil {
+		st.SubscriptionRef = n.SubscriptionRef
 	}
 	switch st.State {
 	case StatePaid:
@@ -258,13 +299,13 @@ func (s *BillingService) confirm(ctx context.Context, g security.Grant, actor se
 			}
 		}
 
-		sub, event, err := s.extend(ctx, g, inv, plan, coupon, paidAt, now)
+		sub, event, err := s.extend(ctx, g, inv, plan, coupon, paidAt, now, providerName, st.SubscriptionRef)
 		if err != nil {
 			return err
 		}
 		if err := s.record(ctx, g, actor, activityInvoicePaid, "billing_invoice", inv.ID, map[string]any{
 			"total": inv.Total, "cycle": inv.Months, "units": inv.Units, "provider": providerName, "method": payment.Method, "subscription": sub.ID,
-			"paid_until": sub.CurrentPeriodEnd.UTC().Format(time.RFC3339),
+			"paid_until": sub.CurrentPeriodEnd.UTC().Format(time.RFC3339), "subscription_ref": sub.ProviderRef,
 		}); err != nil {
 			return err
 		}
@@ -293,7 +334,7 @@ func (s *BillingService) confirm(ctx context.Context, g security.Grant, actor se
 
 // extend starts or extends the subscription a paid invoice is for, and says
 // which event it was.
-func (s *BillingService) extend(ctx context.Context, g security.Grant, inv *Invoice, plan *Plan, coupon *Coupon, paidAt, now time.Time) (*Subscription, EventName, error) {
+func (s *BillingService) extend(ctx context.Context, g security.Grant, inv *Invoice, plan *Plan, coupon *Coupon, paidAt, now time.Time, providerName, subscriptionRef string) (*Subscription, EventName, error) {
 	var sub *Subscription
 	if inv.SubscriptionID != "" {
 		found, err := Subscriptions(s.db).WhereKey(inv.SubscriptionID).FirstOrFail(ctx, g)
@@ -321,6 +362,9 @@ func (s *BillingService) extend(ctx context.Context, g security.Grant, inv *Invo
 		created.GraceDays = plan.GraceDays
 		created.CycleMonths = cycleToStore(plan, inv.Months)
 		created.Units = inv.Units
+		if subscriptionRef != "" {
+			created.Provider, created.ProviderRef = clip(providerName, maxShortLen), clip(subscriptionRef, maxIdentifierLen)
+		}
 		if coupon != nil {
 			created.CouponID, created.CouponRenewalsLeft = coupon.ID, coupon.Renewals
 		}
@@ -364,6 +408,9 @@ func (s *BillingService) extend(ctx context.Context, g security.Grant, inv *Invo
 	sub.CycleMonths = cycleToStore(plan, inv.Months)
 	if inv.Kind == InvoiceNew || event == EventActivated {
 		sub.Units = inv.Units
+	}
+	if subscriptionRef != "" {
+		sub.Provider, sub.ProviderRef = clip(providerName, maxShortLen), clip(subscriptionRef, maxIdentifierLen)
 	}
 	sub.CurrentPeriodStart, sub.CurrentPeriodEnd = period.Start, period.End
 	sub.CancelAtPeriodEnd = false

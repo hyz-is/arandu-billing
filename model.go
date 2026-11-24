@@ -185,6 +185,13 @@ type Subscription struct {
 	// for, the plan's included ones among them. Zero is only the included
 	// units.
 	Units int `db:"units"`
+	// Provider is the name of the gateway that holds this subscription on its
+	// side and renews it by itself, empty for a subscription renewed by
+	// invoices this package issues.
+	Provider string `db:"provider"`
+	// ProviderRef is the gateway's identifier of the subscription. Together
+	// with Provider it is unique when it is not empty.
+	ProviderRef string `db:"provider_ref"`
 	// Renewals is how many times it was renewed after the first payment.
 	Renewals int `db:"renewals"`
 	// Meta is what the consumer attached when it started the subscription.
@@ -264,6 +271,11 @@ type Invoice struct {
 	Provider string `db:"provider"`
 	// ProviderRef is the provider's own identifier of the order or payment.
 	ProviderRef string `db:"provider_ref"`
+	// ChargeRef is the gateway's identifier of a charge the gateway itself
+	// made, such as the renewal of a subscription it holds. It is empty for an
+	// invoice this package asked a checkout for, and unique with Provider when
+	// it is not empty: what keeps one charge from being invoiced twice.
+	ChargeRef string `db:"charge_ref"`
 	// ProviderStatus is the last state the provider reported, as it said it.
 	ProviderStatus string `db:"provider_status"`
 	// CheckoutURL is where the customer pays, empty for a provider with no

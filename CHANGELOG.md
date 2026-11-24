@@ -40,8 +40,38 @@ a release is corrected by another release and never by moving a tag.
   `units_amount` on the invoices, every existing row keeping its price. Run
   `aru migrate`.
 
+- Subscriptions a gateway holds and renews by itself. `Subscription.Provider`
+  and `Subscription.ProviderRef` (unique together when not empty) are filled
+  when an invoice is confirmed with `PaymentStatus.SubscriptionRef` or
+  `Notification.SubscriptionRef`. `Notification` gains `SubscriptionRef`,
+  `Units` and `SubscriptionState`; `PaymentStatus` gains `SubscriptionRef`.
+- `HandleNotification` also handles, in this order, a notification about a
+  subscription's state (`SubscriptionState` set and no invoice named: past_due,
+  expired, canceled, or active while the period is ahead, once, answering a nil
+  invoice), the invoice a notification names, and the renewal a gateway charged
+  by itself (no invoice has the `Reference`, but a subscription holds the
+  `SubscriptionRef`): the invoice is issued without a checkout, for the
+  subscription's cycle and units, and confirmed through `QueryStatus` against
+  its total. A charge repeated or racing is invoiced once, recorded under
+  `Invoice.ChargeRef`, and a subscription already paid for more than half a
+  cycle ahead is not invoiced again. The notification address answers 200 with
+  `{"status":"ok"}` when there is no invoice to answer.
+- `BillingService.SetProviderUnits`, `SetUnits` for the system when the gateway
+  reports the units.
+- The action `RenewalsRecord`, answered for this package's system subject alone.
+- `billingtest.Gateway` plays a gateway with subscriptions: `Renew`,
+  `PayCharge`, `PaySubscription`, `ChargeNotification`, `StateNotification` and
+  `SubscriptionNotification`.
+- The migration `20261124_0009_add_gateway_subscriptions`: `provider` and
+  `provider_ref` on the subscriptions and `charge_ref` on the invoices, with a
+  partial unique index on `(provider, provider_ref)` and on `(provider,
+  charge_ref)` where the identifier is not empty. Run `aru migrate`.
+
 ### Changed
 
+- A subscription moved by a gateway's notice back to active has its end,
+  cancellation and cancel-at-period-end cleared and raises
+  `subscription.activated`.
 - The generated queries are regenerated with the current model generator; they
   gain `ApplyListing` and `Listing` and lose nothing.
 

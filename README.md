@@ -168,6 +168,60 @@ What the package does with the answers is the contract:
   database, so one invoice is paid once however many notifications arrive, in
   whatever order, racing or not. A repeated notification answers 200.
 
+### A gateway that holds subscriptions
+
+A gateway with subscriptions of its own keeps the card and renews each cycle by
+itself, telling the application by webhook. The gateway is the source of truth
+for the money; this package mirrors it. The Provider fills three more fields in
+what `ParseNotification` answers, and `PaymentStatus` may carry the gateway's
+identifier of the subscription:
+
+```go
+billing.Notification{
+	Reference:       "ch_123",   // the charge, and nothing else names an invoice
+	SubscriptionRef: "sub_456",  // the subscription the gateway holds
+	Units:           4,          // the units it charges for; zero says nothing
+}
+billing.Notification{
+	SubscriptionRef:   "sub_456",
+	SubscriptionState: billing.SubscriptionPastDue, // about the subscription, not a payment
+}
+```
+
+`HandleNotification` reads a notification in this order:
+
+1. With a `SubscriptionState` and no invoice named, the subscription found by
+   `(provider, SubscriptionRef)`, in whichever account holds it, is taken to that
+   state once: `past_due` from active or trialing, `expired` and `canceled` from
+   a subscription still served, `active` only while the period it is paid until
+   is ahead. The same state again changes nothing; the event and the activity
+   entry are the ones `SweepDue` writes; `Units`, when it is above zero, is kept
+   too. The answer is a nil invoice and a nil error, and the address answers
+   200. An unknown subscription is `ErrNotFound`.
+2. An invoice named by `InvoiceID` or by `Reference` is confirmed as always.
+   The `SubscriptionRef` of the payment's answer (`PaymentStatus`), or of the
+   notification, binds the subscription to the gateway: `Subscription.Provider`
+   and `Subscription.ProviderRef`, unique together when not empty.
+3. No invoice found, a `Reference` and the `SubscriptionRef` of a subscription
+   the gateway holds: the gateway charged a renewal. The invoice is issued here
+   with no `CreateCheckout`, for the subscription's cycle and units (`Units` of
+   the notification when it is above zero, which is also kept on the
+   subscription) at the plan's price and the recurring coupon, and confirmed
+   through `QueryStatus` for that `Reference` with the same rule as every
+   invoice: only the invoice's total confirms it. The invoice is recorded under
+   the charge (`Invoice.ChargeRef`, unique with the provider), so a charge
+   repeated or racing is invoiced once, and a subscription already paid for more
+   than half a cycle ahead is not invoiced again (nil invoice, 200).
+
+A Provider authenticates what it parses: the state and the units of a
+notification are taken as it read them, and only money is asked again.
+
+Changing seats mid-cycle is `SetUnits` (the account) or `SetProviderUnits` (the
+gateway said so); neither issues an invoice, because the gateway prorates on its
+own side. For tests, `billingtest.Gateway.Renew` makes the in-memory gateway
+charge a renewal, `PayCharge` pays it, and `ChargeNotification`,
+`StateNotification` and `SubscriptionNotification` build the posts.
+
 The customer's return address (`PublicURL` + `/faturas/{id}/retorno` with the
 Portuguese paths) asks the gateway again too, so a payment counts even before
 the notification arrives.
@@ -237,6 +291,7 @@ for JSON gets JSON from every route.
 | --- | --- | --- |
 | a member of an account | signed in to that account | read the plans, the account's subscriptions and invoices |
 | the account's manager | `billing.AccountRole`, or the action `billing.account` through arandu-permission | pay for a plan, start a trial, renew, cancel at the period's end |
+| this package, as its system subject | no one can hold it | confirm a payment the gateway reported, sweep the periods that ended and record what a gateway did on its side (`billing.RenewalsRecord`) |
 | the platform's admin | `billing.AdminRole`, or the action `billing.admin` | keep the plans and coupons, read every account's subscriptions and invoices, confirm a payment by hand, void an invoice, cancel a subscription at once |
 
 A subject inside somebody else's account through arandu-impersonate is never
@@ -264,6 +319,16 @@ invoice's or the subscription's own account.
   `RenewCycle`: it applies to that invoice and, once paid, to every renewal
   after it; the period already paid for stays as it is. A cycle the plan stopped
   offering is refused at renewal until another is chosen.
+- **Units.** A plan includes `IncludedUnits` units (seats, members; zero is one)
+  in its price and sells each one above them at `UnitPrice` for one
+  `IntervalMonths`: `max(units - included, 0) x UnitPrice x months /
+  IntervalMonths`, rounded half up. They join the price for the months in the
+  subtotal, and the cycle's discount and the coupon take theirs off that
+  subtotal (`PriceUnits`; `Price` and `PriceCycle` price no units). A plan with
+  no `UnitPrice` refuses units above the included ones. `SubscribeRequest.Units`
+  chooses them at checkout; every renewal uses `Subscription.Units`, which
+  `SetUnits` changes between 1 and `MaxUnits` for the invoices to come, with no
+  invoice and no charge; an invoice already issued keeps its units.
 - **Recurring coupons.** `Renewals` is how many renewals after the first
   payment keep the discount; a renewal keeps it even if the coupon was
   deactivated afterwards. `MaxUses` counts first payments.
@@ -326,9 +391,13 @@ the policy allowed the admin.
 
 `20261023_0001_create_billing_plans`, `20261023_0002_create_billing_coupons`,
 `20261023_0003_create_billing_subscriptions`,
-`20261023_0004_create_billing_invoices`, `20261023_0005_create_billing_payments`
-and `20261023_0006_create_billing_coupon_usages`, applied by `aru migrate`,
-never at boot.
+`20261023_0004_create_billing_invoices`, `20261023_0005_create_billing_payments`,
+`20261023_0006_create_billing_coupon_usages`,
+`20261122_0007_add_billing_cycles`, `20261124_0008_add_billing_units` and
+`20261124_0009_add_gateway_subscriptions`, applied by `aru migrate`, never at
+boot. The last one writes two partial unique indexes
+(`WHERE provider_ref <> ''` and `WHERE charge_ref <> ''`), which SQLite and
+PostgreSQL both accept.
 
 ## Tests
 

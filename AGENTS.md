@@ -91,12 +91,12 @@ this one must prove about itself it proves in its own suite or nowhere.
 
 | | measured with |
 | --- | --- |
-| 23 Go files in the package at the root, six of them generated | `ls *.go` |
+| 24 Go files in the package at the root, six of them generated | `ls *.go` |
 | `internal/everytenant`: the Global read models, after the policy | `ls internal/everytenant` |
 | `billingtest`: the in-memory gateway; `walletcredit`: the optional arandu-wallet adapter | `ls billingtest walletcredit` |
 | 22 routes behind a session, one notification address without | `grep -c '{get\|{post\|{del' paths.go` |
-| 13 actions the policy answers about | `grep -cE '^\t[A-Za-z]+ +security.Action = ' policy.go` |
-| 6 migrations | `grep -c 'GetName() string' module.go` |
+| 14 actions the policy answers about | `grep -cE '^\t[A-Za-z]+ +security.Action = ' policy.go` |
+| 9 migrations | `grep -c 'GetName() string' module.go` |
 
 The layout is by role rather than by layer:
 
@@ -113,6 +113,7 @@ policy.go               who may do what
 service.go              the catalogue: plans and coupons
 subscription_service.go checkout, trial, renewal, cancellation, the sweep
 payment_service.go      notifications, confirmation, manual payments
+gateway_service.go      what a gateway does on its side: renewals it charges, states, units
 listing.go              the server-side pages the data tables read
 events.go               the Listener's events, and the activity log
 screens.go views.go     what the published views are drawn with

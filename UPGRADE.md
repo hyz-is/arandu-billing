@@ -20,6 +20,23 @@ plan, subscription and invoice that exists keeps its price: a plan with no
   subscription that is being served changes its units with
   `BillingService.SetUnits`, which charges nothing and applies from the next
   invoice.
+### Subscriptions a gateway holds
+
+Run `aru migrate` for `20261124_0009_add_gateway_subscriptions`: `provider` and
+`provider_ref` on `billing_subscriptions`, `charge_ref` on `billing_invoices`, and
+two partial unique indexes. Nothing is removed, and a provider that does not
+fill the new fields behaves as before.
+
+- A Provider that holds subscriptions fills `Notification.SubscriptionRef`,
+  `Units` and `SubscriptionState`, and `PaymentStatus.SubscriptionRef`; see the
+  README. `HandleNotification` may now answer a nil invoice with a nil error (a
+  notification about a subscription, or a charge already paid for): code that
+  calls it directly checks for it. The notification address answers 200 for it.
+- The policy has one more action, `RenewalsRecord`, open to this package's
+  system subject only. A test that walks every action lists it.
+- `billingtest.Gateway.QueryStatus` also looks a status up by the `Reference`
+  asked for, which is how a renewal the gateway charged is paid in tests.
+
 - Republish the views to get the units fields of the plan form:
 
 ```sh

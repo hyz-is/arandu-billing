@@ -23,7 +23,7 @@ import (
 var everyAction = []security.Action{
 	billing.PlansView, billing.PlansManage, billing.CouponsManage, billing.Subscribe,
 	billing.SubscriptionsView, billing.SubscriptionsCancel, billing.SubscriptionsManage,
-	billing.InvoicesView, billing.InvoicesManage, billing.PaymentsConfirm, billing.SubscriptionsSweep,
+	billing.InvoicesView, billing.InvoicesManage, billing.PaymentsConfirm, billing.SubscriptionsSweep, billing.RenewalsRecord,
 }
 
 // adminActions are the ones only the platform's admin takes.
@@ -69,7 +69,7 @@ func TestAMemberReadsTheirOwnAccountAndNothingElse(t *testing.T) {
 			t.Errorf("a member who does not manage the account was allowed %s", a)
 		}
 	}
-	for _, a := range append(adminActions, billing.PaymentsConfirm, billing.SubscriptionsSweep) {
+	for _, a := range append(adminActions, billing.PaymentsConfirm, billing.SubscriptionsSweep, billing.RenewalsRecord) {
 		if err := can(member(), a, "acme"); err == nil {
 			t.Errorf("a member, even one holding a role named admin, was allowed %s", a)
 		}
@@ -101,7 +101,7 @@ func TestThePlatformAdminActsOnEveryAccountForTheAdminActionsAlone(t *testing.T)
 			}
 		}
 	}
-	for _, a := range []security.Action{billing.PaymentsConfirm, billing.SubscriptionsSweep, billing.Subscribe} {
+	for _, a := range []security.Action{billing.PaymentsConfirm, billing.SubscriptionsSweep, billing.RenewalsRecord, billing.Subscribe} {
 		if err := can(platformAdmin(), a, "acme"); err == nil {
 			t.Errorf("the admin was allowed %s inside a customer's account", a)
 		}
@@ -157,6 +157,7 @@ func TestTheServiceRefusesBeforeReachingTheModel(t *testing.T) {
 		"PlansPage":       func() error { _, err := svc.PlansPage(ctx, manager(), billing.PageQuery{}, 25); return err },
 		"CouponsPage":     func() error { _, err := svc.CouponsPage(ctx, manager(), billing.PageQuery{}, 25); return err },
 		"SubsPage":        func() error { _, err := svc.SubscriptionsPage(ctx, guest, billing.PageQuery{}, 25); return err },
+		"SetUnits":        func() error { _, err := svc.SetUnits(ctx, member(), "s1", 3); return err },
 		"SubscriptionsOf": func() error { _, err := svc.SubscriptionsOf(ctx, security.Grant{}); return err },
 	}
 	for name, call := range calls {

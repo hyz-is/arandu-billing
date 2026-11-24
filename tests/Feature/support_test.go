@@ -21,6 +21,7 @@ import (
 	hedatabase "github.com/arandu-io/hesape/database"
 	pgxconnector "github.com/arandu-io/hesape/database/connectors/pgx"
 	sqliteconnector "github.com/arandu-io/hesape/database/connectors/sqlite"
+	"github.com/arandu-io/hesape/database/migrations"
 	hhttp "github.com/arandu-io/hesape/http"
 
 	activitylog "github.com/hyz-is/arandu-activitylog"
@@ -113,6 +114,8 @@ type world struct {
 	events   *events
 	router   *fhttp.Router
 	sessions *security.SessionStore
+	// conn is what the migrations ran against, for a test that runs one again.
+	conn migrations.Connection
 }
 
 // signedIn are the subjects the tests started sessions for: what the session
@@ -168,9 +171,9 @@ func installWith(t *testing.T, extend extension) *world {
 	if err != nil {
 		t.Fatalf("building the module: %v", err)
 	}
-	migrations := hedatabase.ForMigrations(connection)
+	w.conn = hedatabase.ForMigrations(connection)
 	for _, migration := range append(extra, module.Migrations()...) {
-		if err := migration.Up(context.Background(), migrations); err != nil {
+		if err := migration.Up(context.Background(), w.conn); err != nil {
 			t.Fatalf("applying %s: %v", migration.GetName(), err)
 		}
 	}
