@@ -56,6 +56,13 @@ type Plan struct {
 	// Cycles are the billing cycles besides IntervalMonths a subscriber may
 	// choose, each with its discount. Empty offers only IntervalMonths.
 	Cycles CycleList `db:"cycles"`
+	// IncludedUnits is how many units (seats, members) Price already covers.
+	// Zero is one.
+	IncludedUnits int `db:"included_units"`
+	// UnitPrice is what each unit above IncludedUnits adds to one
+	// IntervalMonths period, in centavos. Zero sells no units beyond the
+	// included ones.
+	UnitPrice int64 `db:"unit_price"`
 	// Meta is what the consuming application attaches to the plan: the
 	// cameras it covers, the credits it deposits. This package stores it and
 	// hands it back in every event, and decides nothing from it.
@@ -174,6 +181,10 @@ type Subscription struct {
 	// the one every renewal is invoiced for. Zero follows the plan's own
 	// IntervalMonths.
 	CycleMonths int `db:"cycle_months"`
+	// Units is how many units (seats, members) the subscription is charged
+	// for, the plan's included ones among them. Zero is only the included
+	// units.
+	Units int `db:"units"`
 	// Renewals is how many times it was renewed after the first payment.
 	Renewals int `db:"renewals"`
 	// Meta is what the consumer attached when it started the subscription.
@@ -222,9 +233,15 @@ type Invoice struct {
 	Status InvoiceStatus `db:"status"`
 	// Months is how many months the payment buys: the billing cycle chosen.
 	Months int `db:"months"`
-	// Subtotal is the plan's price for Months at its own rate, before any
-	// discount, in centavos.
+	// Subtotal is the plan's price for Months at its own rate plus
+	// UnitsAmount, before any discount, in centavos.
 	Subtotal int64 `db:"subtotal"`
+	// Units is how many units the invoice charges for, the plan's included
+	// ones among them; zero is only the included units.
+	Units int `db:"units"`
+	// UnitsAmount is the part of Subtotal that the units above the plan's
+	// included ones cost, in centavos.
+	UnitsAmount int64 `db:"units_amount"`
 	// CycleDiscount is what the billing cycle takes off Subtotal, in
 	// centavos.
 	CycleDiscount int64 `db:"cycle_discount"`

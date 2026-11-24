@@ -73,6 +73,7 @@ const (
 	activityCancelWithdrawn     = "subscription.cancel_withdrawn"
 	activitySubscriptionMoved   = "subscription.moved"
 	activitySubscriptionStarted = "subscription.started"
+	activityUnitsChanged        = "subscription.units_changed"
 )
 
 // record writes one entry of the act just done, under the Grant it was

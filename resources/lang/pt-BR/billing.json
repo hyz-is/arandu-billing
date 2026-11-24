@@ -11,6 +11,9 @@
         "coupon": "Cupom",
         "cycle": "Ciclo de cobrança",
         "cycles": "Ciclos de cobrança",
+        "included_units": "Unidades incluídas",
+        "unit_price": "Preço por unidade adicional",
+        "units": "Unidades",
         "created_at": "Emitida em",
         "description": "Descrição",
         "discount": "Desconto",
@@ -85,6 +88,8 @@
         "features_hint": "Um por linha.",
         "meta_hint": "Um nome=valor por linha, lido pela aplicação.",
         "cycles_hint": "Um meses=percentual por linha, por exemplo 3=5 ou 12=17,5. O período do próprio plano sempre é oferecido.",
+        "included_units_hint": "Quantas unidades (assentos, membros) o preço já cobre. Zero vale um.",
+        "unit_price_hint": "O que cada unidade acima das incluídas soma em cada período de pagamento. Zero não vende unidades adicionais.",
         "cycle_option": ":period — :price",
         "cycle_option_discount": ":period — :price (:percent de desconto)",
         "installments_from_hint": "Zero nunca oferece parcelamento.",
@@ -186,7 +191,8 @@
         "subscription_cancel_scheduled": "Cancelamento no fim do período solicitado",
         "subscription_cancel_withdrawn": "Cancelamento desfeito",
         "subscription_moved": "Situação da assinatura alterada",
-        "subscription_started": "Teste iniciado"
+        "subscription_started": "Teste iniciado",
+        "subscription_units_changed": "Unidades alteradas"
     },
     "validation": {
         "summary": ":field: :message",
@@ -211,6 +217,7 @@
         "plan_unknown": "Não é um plano do catálogo.",
         "plan_inactive": "Este plano não está mais à venda.",
         "cycle_unavailable": "não está disponível neste plano",
+        "units_unavailable": "é mais do que este plano vende",
         "cycles_lines": "deve ter linhas meses=percentual",
         "cycles_count": "tem mais de :max ciclos",
         "cycles_repeated": "repete um ciclo",

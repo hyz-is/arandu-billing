@@ -62,9 +62,14 @@ type CheckoutRequest struct {
 	// Months is how many months the payment buys: the billing cycle the
 	// subscriber chose.
 	Months int
+	// Units is how many units (seats, members) the payment charges for, the
+	// plan's included ones among them; zero is only the included units.
+	// UnitsAmount is the part of Subtotal they cost above the included ones.
+	Units       int
+	UnitsAmount int64
 	// Subtotal, CycleDiscount, Discount and Total are in centavos of BRL.
-	// Subtotal is the plan's price for Months before any discount,
-	// CycleDiscount is what the billing cycle takes off it, Discount is what
+	// Subtotal is the plan's price for Months plus UnitsAmount, before any
+	// discount, CycleDiscount is what the billing cycle takes off it, Discount is what
 	// the coupon takes off the rest, and Total is what is charged.
 	Subtotal, CycleDiscount, Discount, Total int64
 	// CouponCode is the coupon applied, empty for none.

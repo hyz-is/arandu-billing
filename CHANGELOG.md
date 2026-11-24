@@ -10,6 +10,41 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
+### Added
+
+- Units (seats, members). A plan may include a number of units in its price and
+  sell more at a price each: `Plan.IncludedUnits` (zero is one) and
+  `Plan.UnitPrice` (centavos per unit above the included ones, for one
+  `IntervalMonths`; zero sells none, and units above the included ones are
+  refused). `PlanRequest` carries both, validated, and the admin's plan form has
+  the `included_units` and `unit_price_brl` fields, in en and pt-BR.
+- The pure rules `PriceUnits`, `UnitsPrice`, `Plan.Included`, `MaxUnits` (1000)
+  and `ErrUnitsUnavailable`. The units cost
+  `max(units - included, 0) * UnitPrice * months / IntervalMonths`, rounded half
+  up to the centavo, and join the price for the months in `Quote.Subtotal`; the
+  cycle's discount and the coupon take their discounts off that subtotal.
+  `Quote.UnitsAmount` is the part the units cost. `Price` and `PriceCycle` keep
+  their signatures and price no units.
+- `Subscription.Units`, `Invoice.Units`, `Invoice.UnitsAmount`,
+  `SubscribeRequest.Units`, `CheckoutRequest.Units` and
+  `CheckoutRequest.UnitsAmount`; `Renew` and `RenewCycle` invoice the units the
+  subscription has. The resources and their JSON carry the new fields.
+- `BillingService.SetUnits` changes the units of one of the account's
+  subscriptions from its next invoice on, between 1 and `MaxUnits`. It issues no
+  invoice and collects nothing, and records `subscription.units_changed` with
+  the units before and after.
+- The migration `20261124_0008_add_billing_units`: `included_units` and
+  `unit_price` on the plans, `units` on the subscriptions, `units` and
+  `units_amount` on the invoices, every existing row keeping its price. Run
+  `aru migrate`.
+
+### Changed
+
+- The generated queries are regenerated with the current model generator; they
+  gain `ApplyListing` and `Listing` and lose nothing.
+
 ## [0.3.0] - 2026-11-22
 
 ### Added

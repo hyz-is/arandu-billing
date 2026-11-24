@@ -2,6 +2,7 @@ package billing
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -26,6 +27,13 @@ type SubscribeRequest struct {
 	// invoice charges the plan's price for those months with the cycle's
 	// discount, and the subscription is paid for that many months.
 	CycleMonths int
+	// Units is how many units (seats, members) to charge for, the plan's
+	// included ones among them; zero is the subscription's own units, or only
+	// the included ones for a subscription that does not exist yet. Units
+	// above what the plan includes are priced at its UnitPrice, and refused
+	// when it has none. A subscription still being served changes its units
+	// with SetUnits, so a different number here is refused.
+	Units int
 	// Reference is what inside the account the subscription pays for, in the
 	// application's words; empty is the account itself. It is set by the
 	// application's own code, never read from a customer's form by this
@@ -47,6 +55,9 @@ func (r SubscribeRequest) Validate() validation.Errors {
 	validation.MaxLen(e, "reference", r.Reference, maxIdentifierLen)
 	if r.CycleMonths < 0 || r.CycleMonths > MaxIntervalMonths {
 		e.Add("cycle", message("between", translation.Replace{"min": "0", "max": itoa(MaxIntervalMonths)}))
+	}
+	if r.Units < 0 || r.Units > MaxUnits {
+		e.Add("units", message("between", translation.Replace{"min": "0", "max": itoa(MaxUnits)}))
 	}
 	if len(r.Meta) > 40 {
 		e.Add("meta", message("meta_count", translation.Replace{"max": "40"}))
@@ -112,7 +123,7 @@ func (s *BillingService) Renew(ctx context.Context, actor security.Subject, subs
 	if sub.Ended() && !bool(plan.Active) {
 		return nil, validation.Errors{"plan_id": {message("plan_inactive")}}
 	}
-	return s.issue(ctx, g, actor, plan, sub, SubscribeRequest{PlanID: plan.ID, CycleMonths: sub.CycleMonthsFor(*plan), Reference: sub.Reference, Meta: sub.Meta, Provider: provider})
+	return s.issue(ctx, g, actor, plan, sub, SubscribeRequest{PlanID: plan.ID, CycleMonths: sub.CycleMonthsFor(*plan), Units: sub.Units, Reference: sub.Reference, Meta: sub.Meta, Provider: provider})
 }
 
 // RenewCycle is Renew in a billing cycle chosen now: the change takes effect
@@ -142,7 +153,7 @@ func (s *BillingService) RenewCycle(ctx context.Context, actor security.Subject,
 	if cycleMonths == 0 {
 		cycleMonths = sub.CycleMonthsFor(*plan)
 	}
-	return s.issue(ctx, g, actor, plan, sub, SubscribeRequest{PlanID: plan.ID, CycleMonths: cycleMonths, Reference: sub.Reference, Meta: sub.Meta, Provider: provider})
+	return s.issue(ctx, g, actor, plan, sub, SubscribeRequest{PlanID: plan.ID, CycleMonths: cycleMonths, Units: sub.Units, Reference: sub.Reference, Meta: sub.Meta, Provider: provider})
 }
 
 // issue prices the period, writes the invoice, and asks the provider for its
@@ -184,8 +195,18 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 	if err != nil {
 		return nil, validation.Errors{"cycle": {message("cycle_unavailable")}}
 	}
-	quote, err := PriceCycle(*plan, cycle.Months, coupon, renewal && coupon != nil, now)
+	units := in.Units
+	if sub != nil && !sub.Ended() && sub.Status != SubscriptionTrialing && units != 0 && units != sub.Units {
+		return nil, validation.Errors{"units": {message("units_unavailable")}}
+	}
+	if units == 0 && sub != nil {
+		units = sub.Units
+	}
+	quote, err := PriceUnits(*plan, cycle.Months, units, coupon, renewal && coupon != nil, now)
 	if err != nil {
+		if errors.Is(err, ErrUnitsUnavailable) {
+			return nil, validation.Errors{"units": {message("units_unavailable")}}
+		}
 		return nil, couponRefusal(err)
 	}
 
@@ -201,7 +222,7 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 	// A checkout asked twice -- a double click, a back button -- answers the
 	// open invoice it already issued rather than a second one.
 	reused, err := Invoices(s.db).Where("status", "=", string(InvoiceOpen)).Where("plan_id", "=", plan.ID).
-		Where("subscription_id", "=", subID).Where("reference", "=", reference).Where("months", "=", cycle.Months).Where("total", "=", quote.Total).
+		Where("subscription_id", "=", subID).Where("reference", "=", reference).Where("months", "=", cycle.Months).Where("units", "=", units).Where("total", "=", quote.Total).
 		Where("coupon_code", "=", couponCodeOf(coupon)).Where("provider", "=", providerName).
 		Where("checkout_url", "!=", "").Where("created_at", ">=", now.Add(-24*time.Hour)).
 		OrderByDesc("created_at").FirstOrFail(ctx, g)
@@ -225,6 +246,7 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 	inv.Kind, inv.Status = kind, InvoiceOpen
 	inv.Months = cycle.Months
 	inv.Subtotal, inv.CycleDiscount, inv.Discount, inv.Total = quote.Subtotal, quote.CycleDiscount, quote.Discount, quote.Total
+	inv.Units, inv.UnitsAmount = units, quote.UnitsAmount
 	if coupon != nil {
 		inv.CouponID, inv.CouponCode = coupon.ID, coupon.Code
 	}
@@ -242,7 +264,7 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 	}
 	if err := s.record(ctx, g, actor, activityInvoiceCreated, "billing_invoice", inv.ID, map[string]any{
 		"plan": plan.Slug, "cycle": inv.Months, "cycle_discount": inv.CycleDiscount, "total": inv.Total, "discount": inv.Discount,
-		"coupon": inv.CouponCode, "provider": providerName,
+		"units": inv.Units, "units_amount": inv.UnitsAmount, "coupon": inv.CouponCode, "provider": providerName,
 	}); err != nil {
 		return nil, err
 	}
@@ -273,6 +295,7 @@ func (s *BillingService) issue(ctx context.Context, g security.Grant, actor secu
 		InvoiceID: inv.ID, Tenant: inv.TenantID,
 		Description: s.labelsFor(ctx).describeInvoice(plan.Name, inv.Months),
 		PlanID:      plan.ID, PlanSlug: plan.Slug, Months: inv.Months,
+		Units: inv.Units, UnitsAmount: inv.UnitsAmount,
 		Subtotal: inv.Subtotal, CycleDiscount: inv.CycleDiscount, Discount: inv.Discount, Total: inv.Total, CouponCode: inv.CouponCode,
 		MaxInstallments: inv.MaxInstallments, Customer: customer, ReturnURL: returnURL, Meta: Meta(meta),
 	})
@@ -295,6 +318,58 @@ func couponCodeOf(c *Coupon) string {
 		return ""
 	}
 	return c.Code
+}
+
+// SetUnits changes how many units (seats, members) one of the account's
+// subscriptions is charged for from its next invoice on. It issues no invoice
+// and collects nothing -- a gateway that holds the subscription prorates on its
+// own side -- and an invoice already issued keeps the units it was priced
+// with. The number is between 1 and MaxUnits and is refused above what the
+// plan includes when the plan has no UnitPrice. The change is recorded as
+// billing.subscription.units_changed with the units before and after.
+func (s *BillingService) SetUnits(ctx context.Context, actor security.Subject, subscriptionID string, units int) (*Subscription, error) {
+	if units < 1 || units > MaxUnits {
+		return nil, validation.Errors{"units": {message("between", translation.Replace{"min": "1", "max": itoa(MaxUnits)})}}
+	}
+	g, err := security.Authorize(ctx, s.policy, actor, Subscribe, Account{TenantID: actor.Tenant})
+	if err != nil {
+		return nil, err
+	}
+	sub, err := Subscriptions(s.db).WhereKey(subscriptionID).FirstOrFail(ctx, g)
+	if err != nil {
+		return nil, notFound(err)
+	}
+	return s.applyUnits(ctx, g, actor, sub, units)
+}
+
+// applyUnits sets the units of a subscription already read under g, and
+// records the change. Units the plan does not sell are refused, and a
+// subscription already at that number is answered as it stands.
+func (s *BillingService) applyUnits(ctx context.Context, g security.Grant, actor security.Subject, sub *Subscription, units int) (*Subscription, error) {
+	plan, err := Plans(s.db).WhereKey(sub.PlanID).FirstOrFail(ctx, g)
+	if err != nil {
+		return nil, notFound(err)
+	}
+	if _, err := UnitsPrice(*plan, 0, units); err != nil {
+		return nil, validation.Errors{"units": {message("units_unavailable")}}
+	}
+	if sub.Units == units {
+		return sub, nil
+	}
+	before := sub.Units
+	now := s.now()
+	claimed, err := Subscriptions(s.db).WhereKey(sub.ID).Where("units", "=", before).Update(ctx, g, map[string]any{"units": units, "updated_at": now})
+	if err != nil {
+		return nil, err
+	}
+	if claimed == 0 {
+		// Somebody changed it first; answer what stands now.
+		return Subscriptions(s.db).WhereKey(sub.ID).FirstOrFail(ctx, g)
+	}
+	sub.Units, sub.UpdatedAt = units, now
+	return sub, s.record(ctx, g, actor, activityUnitsChanged, "billing_subscription", sub.ID, map[string]any{
+		"before": before, "after": units,
+	})
 }
 
 // StartTrial starts the trial of a plan for the asking account: once per plan

@@ -64,6 +64,8 @@ func planFields(labels billing.Labels, form billing.PlanForm, page billing.FormS
 		{Name: "grace_days", Label: labels.T("field.grace_days"), Type: "number", Value: form.GraceDays, Page: page},
 		{Name: "installments_from", Label: labels.T("field.installments_from"), Type: "number", Value: form.InstallmentsFrom, Hint: labels.T("screen.installments_from_hint"), Page: page},
 		{Name: "installments_cap", Label: labels.T("field.installments_cap"), Type: "number", Value: form.InstallmentsCap, Hint: labels.T("screen.installments_cap_hint"), Page: page},
+		{Name: "included_units", Label: labels.T("field.included_units"), Type: "number", Value: form.IncludedUnits, Hint: labels.T("screen.included_units_hint"), Page: page},
+		{Name: "unit_price_brl", Label: labels.T("field.unit_price"), Value: form.UnitPrice, Placeholder: "0,00", Hint: labels.T("screen.unit_price_hint"), Page: page},
 		{Name: "position", Label: labels.T("field.position"), Type: "number", Value: form.Position, Page: page},
 	}
 }

@@ -470,7 +470,7 @@ func (m *Module) adminPlans(ctx *fhttp.Context) error {
 	}
 	return ctx.View(ViewAdminPlans, AdminPlansPageData{
 		Screen: sc, Rows: planRows(sc, page.Rows), Table: tableState(q, page, hiddenColumns(ctx.Request.URL.Query()), m.URLs().AdminPlans()),
-		StoreURL: m.URLs().AdminPlans(), NewPlan: PlanForm{Active: true, IntervalMonths: "1", InstallmentsCap: strconv.Itoa(MaxInstallments)},
+		StoreURL: m.URLs().AdminPlans(), NewPlan: PlanForm{Active: true, IntervalMonths: "1", InstallmentsCap: strconv.Itoa(MaxInstallments), IncludedUnits: "0", UnitPrice: "0,00"},
 	})
 }
 
@@ -492,7 +492,9 @@ func planRequest(ctx *fhttp.Context) (PlanRequest, error) {
 	if err != nil {
 		return PlanRequest{}, validation.Errors{"cycles": {message("cycles_lines")}}
 	}
+	unitPrice, _ := parseReais(ctx.Input("unit_price_brl"))
 	return PlanRequest{
+		IncludedUnits: atoi(ctx.Input("included_units")), UnitPrice: unitPrice,
 		Slug: ctx.Input("slug"), Name: ctx.Input("name"), Description: ctx.Input("description"),
 		Features: strings.Split(ctx.Input("features"), "\n"), Price: price,
 		IntervalMonths: atoi(ctx.Input("interval_months")), TrialDays: atoi(ctx.Input("trial_days")),
@@ -840,7 +842,7 @@ func parseCycles(text string) ([]Cycle, error) {
 func (m *Module) Migrations() []foundation.Migration {
 	return []foundation.Migration{
 		createPlans{}, createCoupons{}, createSubscriptions{},
-		createInvoices{}, createPayments{}, createCouponUsages{}, addBillingCycles{},
+		createInvoices{}, createPayments{}, createCouponUsages{}, addBillingCycles{}, addBillingUnits{},
 	}
 }
 
@@ -852,6 +854,7 @@ var (
 	_ migrations.ReversibleMigration = createPayments{}
 	_ migrations.ReversibleMigration = createCouponUsages{}
 	_ migrations.ReversibleMigration = addBillingCycles{}
+	_ migrations.ReversibleMigration = addBillingUnits{}
 )
 
 // createPlans is the catalogue's table.
@@ -1108,4 +1111,43 @@ func (addBillingCycles) Down(ctx context.Context, conn migrations.Connection) er
 		return err
 	}
 	return conn.Schema().DropColumns(ctx, plansTable, []string{"cycles"})
+}
+
+// addBillingUnits lets a plan charge for units above the ones it includes: the
+// units and their price on a plan, the units a subscription is charged for and
+// the units an invoice charged.
+type addBillingUnits struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (addBillingUnits) GetName() string { return "20261124_0008_add_billing_units" }
+
+// Up adds the columns. Every row that exists keeps its price: no extra units
+// on offer, none charged.
+func (addBillingUnits) Up(ctx context.Context, conn migrations.Connection) error {
+	if err := conn.Schema().Table(ctx, plansTable, func(table *schema.Blueprint) {
+		table.UnsignedSmallInteger("included_units").Default(0)
+		table.BigInteger("unit_price").Default(0)
+	}); err != nil {
+		return err
+	}
+	if err := conn.Schema().Table(ctx, subscriptionsTable, func(table *schema.Blueprint) {
+		table.UnsignedSmallInteger("units").Default(0)
+	}); err != nil {
+		return err
+	}
+	return conn.Schema().Table(ctx, invoicesTable, func(table *schema.Blueprint) {
+		table.UnsignedSmallInteger("units").Default(0)
+		table.BigInteger("units_amount").Default(0)
+	})
+}
+
+// Down drops the columns.
+func (addBillingUnits) Down(ctx context.Context, conn migrations.Connection) error {
+	if err := conn.Schema().DropColumns(ctx, invoicesTable, []string{"units", "units_amount"}); err != nil {
+		return err
+	}
+	if err := conn.Schema().DropColumns(ctx, subscriptionsTable, []string{"units"}); err != nil {
+		return err
+	}
+	return conn.Schema().DropColumns(ctx, plansTable, []string{"included_units", "unit_price"})
 }
